@@ -181,6 +181,8 @@ BRANCH_SUPPORT = 0.25  # share of a crossing cluster that must agree on the bran
 HOLE_MIN = 10      # enclosed regions smaller than this (px, standard box) are pen-overlap slivers
 ARM_RING = 1.5    # arms are read this many crossing-ring radii out from the crossing
 PAIR_TOL = 25     # max deg opposite arms may deviate from a straight line (valid crosses measure <= 18)
+ONE_SIDED_GAP = 225  # deg: all far ink inside a <135 deg wedge = strokes meet only at a tip (V); crosses <= ~186
+READ_RADII = (0.75, 1, 4 / 3, 1.75)  # radii (x arm ring) for the two-lines / too-many-arms checks
 ARM_RADII = (1, 4 / 3)  # arm readings are taken at these multiples of the arm ring; a verdict needs both
 TURN_TOL = 60     # max deg an arm may turn between leaving the crossing and its tip (valid <= 31)
 MERGE_R = 1.6      # crossing clusters closer than this many ring radii are the same crossing
@@ -294,6 +296,19 @@ def classify(crop, rect):
         r = ARM_RING * max(RING * h, 1.2 * sw)
         # misalignment must show at two radii: a real K reads consistently, skeleton spurs near the centre of a
         # thick, acute X give one noisy reading
+        # read the arms leaving the crossing at several radii and require the evidence to agree:
+        # - somewhere, two straight lines must cross (4 of the arms form two opposite pairs; extra arms such as a
+        #   tail are fine). A narrow V fakes a crossing near its tip but never shows two lines (2 arms leave it)
+        # - an overlapping double cross merges into one "crossing" with 6-8 arms; a single cross never shows 6+
+        reads = [arm_angles(crop, cx, cy, k * r) for k in READ_RADII]
+        # a V ends at its tip: seen from there, all its far ink lies inside one wedge (one-sided). Any cross - even
+        # a sharp-angled one or one with a faint arm - still has ink on opposite sides of the crossing
+        far = reads[-2:]
+        if (not any(has_two_lines(a) for a in reads)
+                and all(a and largest_gap(a) >= ONE_SIDED_GAP for a in far)):
+            return "INVALID", 0.8, "not a cross - the strokes only meet at a tip (V / corner shape)"
+        if sum(len(a) >= 6 for a in reads) >= 2:
+            return "INVALID", 0.8, "more than two lines (double cross / scribble)"
         devs = [opposite_deviation(arm_angles(crop, cx, cy, k * r)) for k in ARM_RADII]
         if all(d is not None and d > PAIR_TOL for d in devs):
             return "INVALID", 0.8, "not two lines crossing (arms don't line up)"
@@ -328,6 +343,18 @@ def arm_angles(mask, cx, cy, r):
             cur = []
     runs += [cur] if cur else []
     return [np.degrees(np.angle(np.mean(np.exp(1j * np.array(rn))))) % 360 for rn in runs]
+
+
+def largest_gap(angles):
+    """Largest empty angle (deg) between consecutive arm directions; 360 for a single arm."""
+    a = sorted(angles)
+    return max([(a[(i + 1) % len(a)] - a[i]) % 360 or 360 for i in range(len(a))])
+
+
+def has_two_lines(angles):
+    """Do some 4 of these arm directions form two straight lines (two opposite pairs within PAIR_TOL)?"""
+    from itertools import combinations
+    return len(angles) >= 4 and any(opposite_deviation(list(c)) <= PAIR_TOL for c in combinations(angles, 4))
 
 
 def opposite_deviation(angles):

@@ -108,7 +108,7 @@ The app opens on **Draw on ballot**: the blank EC ballot (`tests/assets/samplevo
 4. **Ink per box**: the printed border is erased and strokes that cross it are re-bridged. Ink in the margin counts only if it continues from inside the box. The crop is rescaled to a standard height and at most 1.8:1 width, so an X across a wide box is as steep as one in a candidate box.
 5. **Topology classifier**: the mark is skeletonized. For every skeleton point, the classifier counts how many strokes cross a small ring around it.
    - **VALID**: exactly one place where 4 strokes meet (X, +, curved or looped crosses, long tails). That point must be inside the box, and most of the ink must be inside too. Sketchy double-stroke crosses get a merged retry.
-   - **INVALID**: no crossing (✓ V ^ / ○ □ ♡ ·), more than 4 branches (✱), two or more enclosed regions (☆), several crossings or marks (XX, X X), extra writing next to the cross ((X), X + text), or a mark outside the box.
+   - **INVALID**: no crossing (✓ V ^ / ○ □ ♡ ·), a narrow V whose tip fakes a crossing (all its ink lies on one side of that point), overlapping double crosses (6+ arms leave the crossing), more than 4 branches (✱), two or more enclosed regions (☆), several crossings or marks (XX, X X), extra writing next to the cross ((X), X + text), or a mark outside the box.
 6. **Stray marks**: ink anywhere on the ballot sheet outside the boxes, found by three detectors:
    - **Vivid pen colour**, for digital pens and bright blue ink.
    - **Faint ballpoint on white paper.** The ink is darker than the paper around it and shifted toward blue in Lab colour space; black print isn't.
