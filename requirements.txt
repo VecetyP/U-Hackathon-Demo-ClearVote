@@ -1,0 +1,5 @@
+opencv-contrib-python>=4.8
+numpy
+pandas
+streamlit>=1.30
+pytest
