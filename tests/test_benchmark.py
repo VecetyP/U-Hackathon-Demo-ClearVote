@@ -452,3 +452,23 @@ def test_not_a_cross_shapes_and_small_box_crosses(name):
                 cv2.polylines(x, [rel(b, [a, c])], False, PEN, th)
                 cv2.polylines(x, [rel(b, [(a[0], c[1]), (c[0], a[1])])], False, PEN, th)
                 assert ballot.vote(x) == n, ("X", name, n, th, a)
+
+
+def test_real_phone_photo_with_pen_marks():
+    """Real photo of a printed EC ballot marked with a blue-black ballpoint (translucent ink: on the green panel it
+    photographs almost neutral, on white it's faintly blue). Checks every box label and that each of the 7 doodles
+    on the paper (3 on the white header, 4 on the green panel) is reported as a stray."""
+    img = cv2.imread(str(pathlib.Path(__file__).parent / "assets" / "real_sample_phone_photo.jpg"))
+    res = ballot.analyze(img)
+    labels = {b["number"] if not b["is_no_vote"] else "nv": b["label"] for b in res["boxes"]}
+    expect = {**{n: "VALID" for n in range(501, 507)}, **{n: "EMPTY" for n in (507, 508, 509, 510, 520)},
+              **{n: "INVALID" for n in range(511, 520)}, "nv": "VALID"}
+    assert labels == expect
+    doodles = [(270, 105), (460, 180), (975, 175), (950, 585), (215, 725), (170, 885), (980, 880)]
+    missed = [d for d in doodles
+              if not any(x - 10 <= d[0] <= x + w + 10 and y - 10 <= d[1] <= y + h + 10 for x, y, w, h in res["strays"])]
+    assert not missed, missed
+    assert len(res["strays"]) == len(doodles) and res["output"] == -1
+
+    # the bottom rows sit in the photo's shadow (paper ~V 166); they are still boxes, so a vote there counts
+    assert {509, 510} <= set(labels)

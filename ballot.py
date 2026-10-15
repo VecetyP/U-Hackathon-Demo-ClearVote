@@ -17,6 +17,7 @@ BOX_AREA = (0.0008, 0.05)  # fraction of image area
 PRINT_MATCH = 0.75      # top cells this similar across columns are printed headers, not marks
 LABEL_COLUMN = 0.7       # columns with black print in this share of cells are name/number labels
 BLOB_FILL = 0.85        # a white blob filling this much of its bounding box is a borderless box
+PAPER_V = 130           # min brightness of blank box paper (photos are often shaded toward one edge)
 PAPER_FRAC = 0.55        # interior must be mostly bright paper
 
 
@@ -43,7 +44,7 @@ def detect_boxes(img, gray):
     lines = cv2.dilate(raw_lines, np.ones((3, 3), np.uint8))
     cnts, _ = cv2.findContours(lines, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    paper = (hsv[..., 2] > 170) & (hsv[..., 1] < 60)
+    paper = (hsv[..., 2] > PAPER_V) & (hsv[..., 1] < 60)  # unsaturated and fairly bright: shaded photos too
     boxes = []
     for c in cnts:
         x, y, w, h = cv2.boundingRect(c)
@@ -422,29 +423,102 @@ SHEET_V = 130     # brightness that counts as ballot paper (any colour); dark su
 SHEET_PART = 0.05  # light regions this big (fraction of image) are part of the ballot sheet
 
 
+BALLPOINT_MIN = 0.6  # a ballpoint doodle is at least this many box-heights in both directions
 PEN_SAT = 120  # pen ink saturation that counts anywhere; camera fringes on dark print stay below it
 
 
-def stray_marks(img, boxes):
-    """Pen-colored ink outside every (expanded) voting box -> list of bboxes."""
-    # ponytail: assumes a blue/violet pen on a black/green/pink print; black-pen strays need a blank-ballot diff
+def stray_marks(img, boxes, lines=None):
+    """Ink outside every (expanded) voting box -> list of bboxes. Three independent detectors:
+    1. vivid pen colour (digital pens, bright blue ink) anywhere on the sheet;
+    2. faint ballpoint on white / neutral paper: darker than the paper AND shifted toward blue (black print isn't);
+    3. dark freehand marks on coloured paper (green / pink panels), where translucent blue-black ink photographs
+       almost neutral: told apart from print by shape (pen-width strokes, at least ~half a box in size, not a solid
+       block, not glued to the big dark print, not a printed line) plus a mild blue shift over the whole mark."""
+    # ponytail: black-pen strays on *white* paper are still invisible (no colour cue); a blank-ballot diff would fix it
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    hue, sat, val = hsv[..., 0], hsv[..., 1], hsv[..., 2]
-    # a phone camera adds a desaturated navy fringe around white-on-black print; real pen ink is strongly
-    # saturated anywhere, and faint (less saturated) strokes only count on light paper
-    light = cv2.medianBlur(val, 31) > 120
-    pen = ((hue >= 95) & (hue <= 140) & (val > 60) & (val < 235)  # near-black pixels have noise hue
-           & ((sat > PEN_SAT) | ((sat > 70) & light))).astype(np.uint8)
-    pen &= paper_mask(hsv, boxes)
+    sheet = paper_mask(hsv, boxes)
+    bh = float(np.median([h for *_, h in boxes]))
+    grid = np.zeros(img.shape[:2], np.uint8)
     for x, y, w, h in boxes:
         m = int(MARGIN * h)
-        pen[max(0, y - m):y + h + m, max(0, x - m):x + w + m] = 0
+        grid[max(0, y - m):y + h + m, max(0, x - m):x + w + m] = 1
+
+    # 1. vivid pen colour. A phone camera adds a desaturated navy fringe around white-on-black print; real pen ink
+    #    is strongly saturated anywhere, and fainter strokes only count on light paper
+    hue, sat, val = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    light = cv2.medianBlur(val, 31) > 120
+    pen = ((hue >= 95) & (hue <= 140) & (val > 60) & (val < 235)  # near-black pixels have noise hue
+           & ((sat > PEN_SAT) | ((sat > 70) & light))).astype(np.uint8) & sheet
+    pen[grid > 0] = 0
     pen = cv2.morphologyEx(pen, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
     n, _, st, _ = cv2.connectedComponentsWithStats(pen, 8)
-    bh = np.median([h for *_, h in boxes])
     # real doodles have 2-D extent; JPEG chroma halos along printed edges are 1-4 px thin
-    return [tuple(int(v) for v in st[i, :4]) for i in range(1, n)
-            if st[i, 4] >= 0.01 * bh * bh * 1.7 and min(st[i, 2], st[i, 3]) >= 0.15 * bh]
+    found = [tuple(int(v) for v in st[i, :4]) for i in range(1, n)
+             if st[i, 4] >= 0.017 * bh * bh and min(st[i, 2], st[i, 3]) >= 0.15 * bh]
+
+    # 2 + 3. ballpoint ink judged against its local paper colour (Lab; a closing wider than a stroke = paper)
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+    paper = lambda ch: cv2.medianBlur(cv2.morphologyEx(ch, cv2.MORPH_CLOSE, k), 21).astype(np.int16)
+    L, b = lab[..., 0].astype(np.int16), lab[..., 2].astype(np.int16)
+    pL, pa, pb = paper(lab[..., 0]), paper(lab[..., 1]) - 128, paper(lab[..., 2])
+    darker, bluer = pL - L, pb - b
+    neutral = (np.abs(pa) < 12) & (np.abs(pb - 128) < 12) & (pL > 150)
+    coloured = (np.hypot(pa, pb - 128) > 18) & (pL > 110)
+    # edges of big solid dark print (number columns, title band) are not handwriting
+    n, lab_dark, st, _ = cv2.connectedComponentsWithStats((L < 90).astype(np.uint8), 8)
+    big = np.isin(lab_dark, [i for i in range(1, n) if st[i, 4] > 2 * bh * bh]).astype(np.uint8)
+    keep_out = (cv2.dilate(big, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))) > 0) | (grid > 0)
+    if lines is not None:
+        # printed rules are long; straight stretches of a pen stroke are short and must stay
+        n, lab_l, st, _ = cv2.connectedComponentsWithStats(lines, 8)
+        long_lines = np.isin(lab_l, [i for i in range(1, n) if max(st[i, 2], st[i, 3]) >= 3 * bh]).astype(np.uint8)
+        keep_out |= cv2.dilate(long_lines, np.ones((5, 5), np.uint8)) > 0
+    for kind, mask, min_blue in (("white", neutral & (darker > 25) & (bluer > 8), 10),
+                                 ("colour", coloured & (darker > 35), 5)):
+        mask = (mask & (sheet > 0) & ~keep_out).astype(np.uint8)
+        n, lab_i, st, _ = cv2.connectedComponentsWithStats(
+            cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))), 8)
+        for i in range(1, n):
+            x, y, w, h, _ = st[i]
+            if not (BALLPOINT_MIN * bh <= min(w, h) and max(w, h) <= 4 * bh):
+                continue  # print-sized text, slivers, or sheet-sized shading
+            comp = (lab_i[y:y + h, x:x + w] == i) & (mask[y:y + h, x:x + w] > 0)
+            px = comp.sum()
+            stroke = px / max(1, (cv2.ximgproc.thinning(comp.astype(np.uint8) * 255) > 0).sum())
+            hull = cv2.contourArea(cv2.convexHull(cv2.findNonZero(comp.astype(np.uint8)))) + 1
+            if (px < 0.017 * bh * bh or stroke < 1.8 or px / (w * h) > 0.45 or px / hull > 0.7
+                    or np.median(bluer[y:y + h, x:x + w][comp]) < min_blue):
+                continue
+            # printed shapes wider than the paper estimate (an arrow, a logo) only show their outline as "darker
+            # than paper"; their inside is dark too, while a doodle encloses mostly paper
+            hull_mask = np.zeros((h, w), np.uint8)
+            cv2.fillConvexPoly(hull_mask, cv2.convexHull(cv2.findNonZero(comp.astype(np.uint8))), 1)
+            ring = np.concatenate([L[y, x:x + w], L[y + h - 1, x:x + w], L[y:y + h, x], L[y:y + h, x + w - 1]])
+            if (L[y:y + h, x:x + w][hull_mask > 0] < np.median(ring) - 35).mean() > 0.5:
+                continue
+            found.append((int(x), int(y), int(w), int(h)))
+    return merge_rects(found)
+
+
+def merge_rects(rects):
+    """Union overlapping rectangles (one doodle seen by two detectors is one stray)."""
+    rects = list(rects)
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(rects)):
+            for j in range(i + 1, len(rects)):
+                a, b = rects[i], rects[j]
+                if a[0] <= b[0] + b[2] and b[0] <= a[0] + a[2] and a[1] <= b[1] + b[3] and b[1] <= a[1] + a[3]:
+                    x0, y0 = min(a[0], b[0]), min(a[1], b[1])
+                    rects[i] = (x0, y0, max(a[0] + a[2], b[0] + b[2]) - x0, max(a[1] + a[3], b[1] + b[3]) - y0)
+                    del rects[j]
+                    merged = True
+                    break
+            if merged:
+                break
+    return rects
 
 
 def paper_mask(hsv, boxes):
@@ -492,7 +566,7 @@ def analyze(img, first_number=1):
             number, source = (number, "printed") if number is not None else (first_number + i, "position")
         res["boxes"].append(dict(bbox=b, number=number, number_source=source, is_no_vote=b == no_vote,
                                  label=label, confidence=conf, reason=reason))
-    res["strays"] = stray_marks(img, boxes)
+    res["strays"] = stray_marks(img, boxes, lines)
     counts = {k: sum(r["label"] == k for r in res["boxes"]) for k in COLORS}
     res["counts"] = dict(total=len(boxes), **counts)
     valid = [r for r in res["boxes"] if r["label"] == "VALID"]

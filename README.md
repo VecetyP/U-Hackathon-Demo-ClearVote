@@ -109,7 +109,10 @@ The app opens on **Draw on ballot**: the blank EC ballot (`tests/assets/samplevo
 5. **Topology classifier**: the mark is skeletonized. For every skeleton point, the classifier counts how many strokes cross a small ring around it.
    - **VALID**: exactly one place where 4 strokes meet (X, +, curved or looped crosses, long tails). That point must be inside the box, and most of the ink must be inside too. Sketchy double-stroke crosses get a merged retry.
    - **INVALID**: no crossing (✓ V ^ / ○ □ ♡ ·), more than 4 branches (✱), two or more enclosed regions (☆), several crossings or marks (XX, X X), extra writing next to the cross ((X), X + text), or a mark outside the box.
-6. **Stray marks**: blue/violet pen ink on the ballot paper, outside every box.
+6. **Stray marks**: ink anywhere on the ballot sheet outside the boxes, found by three detectors:
+   - **Vivid pen colour**, for digital pens and bright blue ink.
+   - **Faint ballpoint on white paper.** The ink is darker than the paper around it and shifted toward blue in Lab colour space; black print isn't.
+   - **Dark freehand marks on coloured panels.** Translucent blue-black ink photographs almost neutral there, so it's told apart from print by shape: pen-width strokes, at least about half a box in size, enclosing paper rather than solid, not part of the box grid, the large dark print or a long printed line.
 7. **Verdict**:
    - **บัตรเสีย**: any INVALID box, two or more VALID boxes, or any stray mark.
    - **บัตรดี**: exactly one VALID candidate box.
@@ -121,5 +124,6 @@ Every threshold is a named constant at the top of its section in `ballot.py`. Tu
 
 - The digit matcher is tuned for printed sans/serif fonts, Thai UI fonts and OpenCV fonts. Decorative or handwritten numbers fall back to position-based numbering.
 - A cross needs two strokes that clearly intersect: crossings sharper than about 45°, especially with a thick pen in a small box (phone photos), can be read as invalid. A "V" with a stroke through it at a gentle angle can still pass as a cross. Measured on randomized marks; see the stress numbers in the git history.
-- Stray-mark detection assumes a blue or violet pen. Black-pen strays would need a diff against a blank ballot.
+- Stray marks drawn over dark print (the title band, the black number columns) are mostly missed, since dark ink on black barely shows. Marks smaller than about half a box on coloured panels, and black-pen marks on white paper, are also missed. A diff against a blank ballot would close these gaps.
+- On simulated ballpoint doodles, the detectors catch roughly 95% on white paper and 55–100% on coloured panels, depending on the photo. A photo of a screen is the weakest case. There are zero false strays on all clean test ballots.
 - Torn or folded ballots are not detected beyond the "no boxes found" and "blurry" warnings.
