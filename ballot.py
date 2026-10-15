@@ -178,6 +178,10 @@ RETRY_RINGS = (0.14, 0.17, 0.2)  # wider rings tried for the sketchy-stroke retr
 INSIDE_MIN = 0.75  # at least this share of the mark's ink must be inside the box
 BRANCH_SUPPORT = 0.25  # share of a crossing cluster that must agree on the branch count
 HOLE_MIN = 10      # enclosed regions smaller than this (px, standard box) are pen-overlap slivers
+ARM_RING = 1.5    # arms are read this many crossing-ring radii out from the crossing
+PAIR_TOL = 25     # max deg opposite arms may deviate from a straight line (valid crosses measure <= 18)
+ARM_RADII = (1, 4 / 3)  # arm readings are taken at these multiples of the arm ring; a verdict needs both
+TURN_TOL = 60     # max deg an arm may turn between leaving the crossing and its tip (valid <= 31)
 MERGE_R = 1.6      # crossing clusters closer than this many ring radii are the same crossing
 CLUSTER_MIN = 15   # px in a crossing cluster to count as a real crossing
 
@@ -193,7 +197,9 @@ def ink_mask(gray, boxes, lines):
     ink = (gray.astype(np.int16) < bg.astype(np.int16) - 45).astype(np.uint8) * 255
     band = np.zeros_like(ink)
     for x, y, w, h in boxes:
-        cv2.rectangle(band, (x, y), (x + w - 1, y + h - 1), 255, 8 * BAND)  # wide enough for a few degrees of tilt
+        # band around the printed border, scaled to the box: a few degrees of tilt (~5% of the width) plus the
+        # border itself. A fixed width swallowed half of a small box (and the pen strokes in it) in photos
+        cv2.rectangle(band, (x, y), (x + w - 1, y + h - 1), 255, int(0.1 * w) + 8)
     erase = cv2.dilate(lines, np.ones((7, 7), np.uint8)) & band
     ink[erase > 0] = 0
     bridged = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)))
@@ -276,13 +282,86 @@ def classify(crop, rect):
     if not clusters:
         return "INVALID", 0.85, "no crossing (not an X / +)"
     branches, cx, cy = clusters[0]
-    if branches > 4:
+    if branches > 4 and not two_lines(crop, cx, cy, ARM_RING * max(RING * h, 1.2 * sw)):
         return "INVALID", 0.75, f"{branches} branches (star / asterisk)"
     inside = crop[y:y + h, x:x + w]
     if not (x < cx < x + w and y < cy < y + h) or (inside > 0).sum() < INSIDE_MIN * (crop > 0).sum():
         return "INVALID", 0.85, "mark outside the box"
+    if not sketchy:
+        # "two lines clearly intersect": opposite arms must continue each other (rules out K / arrow shapes),
+        # and each arm must keep heading away from the crossing (rules out a V corner hanging off it)
+        r = ARM_RING * max(RING * h, 1.2 * sw)
+        # misalignment must show at two radii: a real K reads consistently, skeleton spurs near the centre of a
+        # thick, acute X give one noisy reading
+        devs = [opposite_deviation(arm_angles(crop, cx, cy, k * r)) for k in ARM_RADII]
+        if all(d is not None and d > PAIR_TOL for d in devs):
+            return "INVALID", 0.8, "not two lines crossing (arms don't line up)"
+        if any(t > TURN_TOL for t in arm_turns(crop, cx, cy, r)):
+            return "INVALID", 0.8, "extra strokes - an arm bends back (not a clean cross)"
     conf = 0.95 - 0.1 * (len(comps) > 1) - 0.1 * sketchy
     return "VALID", round(conf, 2), "single cross inside box"
+
+
+def two_lines(mask, cx, cy, r):
+    """Read further out than the crossing ring, do exactly 4 arms form two straight lines (at both radii)?
+    Overrides a noisy branch count near the centre of a thick, shallow X; an asterisk shows 6 arms out here."""
+    devs = [opposite_deviation(arm_angles(mask, cx, cy, k * r)) for k in ARM_RADII]
+    return all(d is not None and d <= PAIR_TOL for d in devs)
+
+
+def arm_angles(mask, cx, cy, r):
+    """Directions (deg) in which strokes leave (cx, cy), read on a ring of radius r."""
+    sk = cv2.dilate(cv2.ximgproc.thinning(mask), np.ones((2, 2), np.uint8)) > 0
+    th = np.linspace(0, 2 * np.pi, max(32, int(2 * np.pi * r)), endpoint=False)
+    on = sk[np.clip(np.round(cy + r * np.sin(th)).astype(int), 0, mask.shape[0] - 1),
+            np.clip(np.round(cx + r * np.cos(th)).astype(int), 0, mask.shape[1] - 1)]
+    if on.all() or not on.any():
+        return []
+    k = int(np.argmin(on))  # start the walk in a gap so no run wraps around
+    runs, cur = [], []
+    for o, a in zip(np.roll(on, -k), np.roll(th, -k)):
+        if o:
+            cur.append(a)
+        elif cur:
+            runs.append(cur)
+            cur = []
+    runs += [cur] if cur else []
+    return [np.degrees(np.angle(np.mean(np.exp(1j * np.array(rn))))) % 360 for rn in runs]
+
+
+def opposite_deviation(angles):
+    """For 4 arms: how far (deg) the worst opposite pair is from a straight line. None if not 4 arms."""
+    if len(angles) != 4:
+        return None
+    a = sorted(angles)
+    off = lambda u, v: abs(((v - u) % 360) - 180)
+    return max(off(a[0], a[2]), off(a[1], a[3]))
+
+
+def arm_turns(mask, cx, cy, r):
+    """Per arm leaving the crossing: angle (deg) between its start direction and the direction to its tip.
+    An arm that returns into the crossing (the loop of a loop-cross) is skipped."""
+    sk = cv2.ximgproc.thinning(mask)
+    yy, xx = np.nonzero(sk)
+    far = np.hypot(xx - cx, yy - cy) > r
+    out = np.zeros_like(sk)
+    out[yy[far], xx[far]] = 255
+    n, lab = cv2.connectedComponents(out, connectivity=8)
+    turns = []
+    for j in range(1, n):
+        ys, xs = np.nonzero(lab == j)
+        d = np.hypot(xs - cx, ys - cy)
+        near = d < r + 3
+        if near.sum() == 0 or len(xs) < 4:
+            continue
+        start = np.arctan2(ys[near] - cy, xs[near] - cx)
+        if np.ptp(start) > 0.6:  # touches the ring in two places: a loop
+            continue
+        a0 = np.arctan2(ys[near].mean() - cy, xs[near].mean() - cx)
+        k = int(np.argmax(d))
+        a1 = np.arctan2(ys[k] - cy, xs[k] - cx)
+        turns.append(abs(np.degrees((a1 - a0 + np.pi) % (2 * np.pi) - np.pi)))
+    return turns
 
 
 def crossing_clusters(mask, R, strict=False):
@@ -339,6 +418,7 @@ def number_strip(img, boxes, b):
     return img[b[1]:b[1] + b[3], x0:x1].copy()
 
 
+SHEET_V = 130     # brightness that counts as ballot paper (any colour); dark surroundings stay out
 SHEET_PART = 0.05  # light regions this big (fraction of image) are part of the ballot sheet
 
 
@@ -371,7 +451,8 @@ def paper_mask(hsv, boxes):
     """The ballot sheet: convex hull of the light regions holding boxes plus any large light region
     (e.g. the white header above the black title banner), so strays anywhere on the paper count.
     Small light islands outside the hull (logos / captions around a test infographic) stay out."""
-    light = ((hsv[..., 2] > 150) & (hsv[..., 1] < 130)).astype(np.uint8)
+    # bright of any colour: printed panels (green / pink) are paper too, however saturated the camera makes them
+    light = (hsv[..., 2] > SHEET_V).astype(np.uint8)
     light = cv2.morphologyEx(light, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
     cnts, _ = cv2.findContours(light, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     big = SHEET_PART * light.size

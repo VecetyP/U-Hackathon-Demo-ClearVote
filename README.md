@@ -120,5 +120,6 @@ Every threshold is a named constant at the top of its section in `ballot.py`. Tu
 ## Known limits
 
 - The digit matcher is tuned for printed sans/serif fonts, Thai UI fonts and OpenCV fonts. Decorative or handwritten numbers fall back to position-based numbering.
+- A cross needs two strokes that clearly intersect: crossings sharper than about 45°, especially with a thick pen in a small box (phone photos), can be read as invalid. A "V" with a stroke through it at a gentle angle can still pass as a cross. Measured on randomized marks; see the stress numbers in the git history.
 - Stray-mark detection assumes a blue or violet pen. Black-pen strays would need a diff against a blank ballot.
 - Torn or folded ballots are not detected beyond the "no boxes found" and "blurry" warnings.

@@ -418,3 +418,37 @@ def test_phone_photo_of_ballot():
     v = img.copy()
     cv2.ellipse(v, (400, 270), (120, 30), 0, 0, 360, app_pen, 4)  # doodle in the white header
     assert ballot.vote(v) == -1
+
+
+def _ballot_boxes(name):
+    img = cv2.imread(str(pathlib.Path(__file__).parent / "assets" / name))
+    res = ballot.analyze(img, first_number=501)
+    s = max(1.0, max(img.shape[:2]) / ballot.MAX_SIDE)
+    return img, [tuple(int(v * s) for v in b["bbox"]) for b in res["boxes"] if not b["is_no_vote"]], \
+        [b["number"] for b in res["boxes"] if not b["is_no_vote"]]
+
+
+@pytest.mark.parametrize("name", ["samplevoteFlat.png", "custom_ballot_gaps.png", "phone_photo.jpg"])
+def test_not_a_cross_shapes_and_small_box_crosses(name):
+    """General shape rules (not tuned to one photo):
+    - K / arrow: 4 arms meet but they don't form two lines -> INVALID
+    - V with a stroke through it: an arm runs into a corner and turns back -> INVALID
+    - a plain X (diagonal / steep) at two pen widths stays VALID, including in small photo boxes"""
+    img, boxes, numbers = _ballot_boxes(name)
+    rel = lambda b, pts: np.int32([(b[0] + u * b[2], b[1] + v * b[3]) for u, v in pts])
+    for b, n in list(zip(boxes, numbers))[::4]:
+        for th in (3, 5):
+            k = img.copy()  # K
+            cv2.polylines(k, [rel(b, [(.35, .15), (.35, .85)])], False, PEN, th)
+            cv2.polylines(k, [rel(b, [(.78, .18), (.35, .5), (.78, .82)])], False, PEN, th)
+            assert ballot.vote(k) == -1, ("K", name, n, th)
+            vs = img.copy()  # V with a stroke through its left arm
+            cv2.polylines(vs, [rel(b, [(.15, .2), (.35, .85), (.55, .2)])], False, PEN, th)
+            cv2.polylines(vs, [rel(b, [(.3, .3), (.8, .75)])], False, PEN, th)
+            assert ballot.vote(vs) == -1, ("V+stroke", name, n, th)
+            # diagonal and steep X. Known limit (README): a shallow X drawn with a thick pen in a small photo box
+            for a, c in (((.2, .2), (.8, .8)), ((.33, .12), (.67, .88))):
+                x = img.copy()  # X: two straight strokes through the middle
+                cv2.polylines(x, [rel(b, [a, c])], False, PEN, th)
+                cv2.polylines(x, [rel(b, [(a[0], c[1]), (c[0], a[1])])], False, PEN, th)
+                assert ballot.vote(x) == n, ("X", name, n, th, a)
