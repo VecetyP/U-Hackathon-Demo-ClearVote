@@ -16,6 +16,7 @@ BOX_ASPECT = (1.1, 4.0)  # w/h of a voting square
 BOX_AREA = (0.0008, 0.05)  # fraction of image area
 PRINT_MATCH = 0.75      # top cells this similar across columns are printed headers, not marks
 LABEL_COLUMN = 0.7       # columns with black print in this share of cells are name/number labels
+BLOB_FILL = 0.85        # a white blob filling this much of its bounding box is a borderless box
 PAPER_FRAC = 0.55        # interior must be mostly bright paper
 
 
@@ -26,9 +27,6 @@ def normalize(img):
         img = cv2.resize(img, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
     warnings = []
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    if gray.mean() < 110:
-        img, gray = 255 - img, 255 - gray
-        warnings.append("inverted colors detected - auto-corrected")
     if cv2.Laplacian(gray, cv2.CV_64F).var() < 60:
         warnings.append("image looks blurry - results may be unreliable")
     return img, gray, warnings
@@ -61,6 +59,10 @@ def detect_boxes(img, gray):
             continue
         boxes.append((x, y, w, h))
     boxes = dedupe(boxes)
+    # fallback for photos: a box whose border is lost (e.g. bottom row flush with the end of a dark column)
+    # still shows up as a white rectangle; only fill places the line detector left empty
+    boxes += [b for b in blob_boxes(paper, H * W)
+              if all(iou(b, o) < 0.3 and not contains(o, b, 6) and not contains(b, o, 6) for o in boxes)]
     # drop sub-cells (e.g. quadrants cut by a "+" that spans the box) and small text-like fragments
     # ...but a frame whose inner cell fills most of it is a container (no-vote frame = label strip + mark area):
     # keep the inner mark area instead
@@ -129,6 +131,20 @@ def drop_printed(gray, boxes):
 def contains(o, b, tol=4):
     return (o[0] - tol <= b[0] and o[1] - tol <= b[1]
             and b[0] + b[2] <= o[0] + o[2] + tol and b[1] + b[3] <= o[1] + o[3] + tol)
+
+
+def blob_boxes(paper, area):
+    """White rectangles (blank paper cells) found as blobs, pen strokes inside closed over first."""
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    m = cv2.morphologyEx(paper.astype(np.uint8) * 255, cv2.MORPH_CLOSE, k)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    n, _, st, _ = cv2.connectedComponentsWithStats(m, 8)
+    out = []
+    for x, y, w, h, a in st[1:]:
+        if (BOX_ASPECT[0] <= w / h <= BOX_ASPECT[1] and BOX_AREA[0] <= w * h / area <= BOX_AREA[1]
+                and a >= BLOB_FILL * w * h):
+            out.append((int(x), int(y), int(w), int(h)))
+    return out
 
 
 def iou(a, b):
@@ -326,12 +342,19 @@ def number_strip(img, boxes, b):
 SHEET_PART = 0.05  # light regions this big (fraction of image) are part of the ballot sheet
 
 
+PEN_SAT = 120  # pen ink saturation that counts anywhere; camera fringes on dark print stay below it
+
+
 def stray_marks(img, boxes):
     """Pen-colored ink outside every (expanded) voting box -> list of bboxes."""
     # ponytail: assumes a blue/violet pen on a black/green/pink print; black-pen strays need a blank-ballot diff
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    pen = ((hsv[..., 0] >= 95) & (hsv[..., 0] <= 140) & (hsv[..., 1] > 70)
-           & (hsv[..., 2] > 60) & (hsv[..., 2] < 235)).astype(np.uint8)  # near-black pixels have noise hue
+    hue, sat, val = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    # a phone camera adds a desaturated navy fringe around white-on-black print; real pen ink is strongly
+    # saturated anywhere, and faint (less saturated) strokes only count on light paper
+    light = cv2.medianBlur(val, 31) > 120
+    pen = ((hue >= 95) & (hue <= 140) & (val > 60) & (val < 235)  # near-black pixels have noise hue
+           & ((sat > PEN_SAT) | ((sat > 70) & light))).astype(np.uint8)
     pen &= paper_mask(hsv, boxes)
     for x, y, w, h in boxes:
         m = int(MARGIN * h)
@@ -363,11 +386,19 @@ def paper_mask(hsv, boxes):
 def analyze(img, first_number=1):
     img, gray, warnings = normalize(img)
     found, lines = detect_boxes(img, gray)
+    if len(found) < 2:
+        # maybe a negative (white print on black): use it only if the ballot shows up that way. Brightness
+        # alone can't tell - a phone photo with a dark surround is as dark on average as a true negative
+        inv, inv_gray = 255 - img, 255 - gray
+        inv_found, inv_lines = detect_boxes(inv, inv_gray)
+        if len(inv_found) > len(found):
+            img, gray, found, lines = inv, inv_gray, inv_found, inv_lines
+            warnings.append("inverted colors detected - auto-corrected")
     cands, no_vote = layout(found)
     boxes = cands + ([no_vote] if no_vote else [])
     res = {"boxes": [], "strays": [], "warnings": warnings, "voted_number": None, "number_crop": None}
     if not boxes:
-        res.update(verdict=VERDICT_NOBOX, counts=dict(total=0, VALID=0, INVALID=0, EMPTY=0), overlay=img)
+        res.update(verdict=VERDICT_NOBOX, counts=dict(total=0, VALID=0, INVALID=0, EMPTY=0), overlay=img, output=-1)
         res["warnings"].append("no voting boxes found - is this a blank sheet or a ballot photo?")
         return res
     ink = ink_mask(gray, boxes, lines)

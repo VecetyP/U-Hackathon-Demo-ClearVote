@@ -122,8 +122,13 @@ def test_synthetic_layouts(make):
 
 
 def test_blank_sheet():
-    res = ballot.analyze(np.full((800, 600, 3), 255, np.uint8))
-    assert res["verdict"] == ballot.VERDICT_NOBOX and res["counts"]["total"] == 0
+    blank = np.full((800, 600, 3), 255, np.uint8)
+    res = ballot.analyze(blank)
+    assert res["verdict"] == ballot.VERDICT_NOBOX and res["counts"]["total"] == 0 and res["output"] == -1
+    obj = ballot.evaluate(blank)  # every entry point must answer, not crash, when no ballot is found
+    assert obj["output"] == -1 == ballot.vote(blank)
+    assert obj["analysis"]["verdict"] == "no_ballot" and obj["analysis"]["marks"] == []
+    assert obj["analysis"]["image"][:8] == b"\x89PNG\r\n\x1a\n"
 
 
 # ---- real EC municipal ballot (green), blank scan ----
@@ -391,3 +396,25 @@ def test_http_endpoint():
             assert json.loads(r.read()) == {"ok": True}
     finally:
         srv.shutdown()
+
+
+def test_phone_photo_of_ballot():
+    """Phone photo of the EC ballot on a monitor: dark surround (must not be treated as a negative), perspective
+    (bottom-row boxes lose their lower border), camera colour fringes on white-on-black print (not strays)."""
+    img = cv2.imread(str(pathlib.Path(__file__).parent / "assets" / "phone_photo.jpg"))
+    res = ballot.analyze(img)
+    assert sorted(b["number"] for b in res["boxes"] if not b["is_no_vote"]) == list(range(501, 521))
+    assert sum(b["is_no_vote"] for b in res["boxes"]) == 1 and not res["strays"]
+    assert res["output"] == 0 and not any("inverted" in w for w in res["warnings"])
+
+    boxes = {b["number"] if not b["is_no_vote"] else "nv": b["bbox"] for b in res["boxes"]}
+    app_pen = (191, 63, 31)  # the drawing canvas colour (#1f3fbf)
+    for key, expected in ((507, 507), (520, 520), ("nv", 0)):
+        v = img.copy()
+        x, y, w, h = boxes[key]
+        cv2.line(v, (x + w // 5, y + h // 5), (x + 4 * w // 5, y + 4 * h // 5), app_pen, 4)
+        cv2.line(v, (x + w // 5, y + 4 * h // 5), (x + 4 * w // 5, y + h // 5), app_pen, 4)
+        assert ballot.vote(v) == expected, key
+    v = img.copy()
+    cv2.ellipse(v, (400, 270), (120, 30), 0, 0, 360, app_pen, 4)  # doodle in the white header
+    assert ballot.vote(v) == -1

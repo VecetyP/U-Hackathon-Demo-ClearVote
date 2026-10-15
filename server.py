@@ -81,6 +81,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, evaluate_json(data, first))
         except ValueError as e:
             self.send_json(400, {"error": str(e)})
+        except Exception as e:  # never drop the connection: the web app always gets JSON back
+            self.send_json(500, {"error": f"pipeline failed: {type(e).__name__}: {e}"})
 
 
 def main():
