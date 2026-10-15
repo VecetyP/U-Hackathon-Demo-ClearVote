@@ -234,6 +234,13 @@ def make_custom_ballots(font_dir="C:/Windows/Fonts"):
         d.text((120, y + 35), "ไม่ประสงค์ลงคะแนน", font=thai, fill="black")
         d.rectangle([840, y, 1020, y + 110], outline="black", width=4)
         im.save(pathlib.Path(__file__).parent / "assets" / fname)
+    # same ballot with the no-vote row printed on a hot-pink band (box interior stays white)
+    img = cv2.imread(str(pathlib.Path(__file__).parent / "assets" / "custom_ballot_gaps.png"))
+    x, y, w, h = 839, 1179, 184, 113
+    band = img.copy()
+    band[y - 60:y + h + 60, :] = (180, 105, 255)
+    band[y:y + h, x:x + w] = img[y:y + h, x:x + w]
+    cv2.imwrite(str(pathlib.Path(__file__).parent / "assets" / "custom_ballot_band.png"), band)
 
 
 
@@ -275,3 +282,36 @@ def test_custom_ballot_output_codes(fname):
 
 if __name__ == "__main__":
     make_custom_ballots()
+
+
+def hand_x(img, box, th=5):
+    """Freehand-style X as drawn in the app: one stroke hooks into the box's bottom-right border, the other bows."""
+    x, y, w, h = box
+    a = [(x + 0.18 * w, y + 0.28 * h), (x + 0.45 * w, y + 0.5 * h), (x + 0.74 * w, y + 0.84 * h),
+         (x + 0.84 * w, y + 0.98 * h), (x + 0.92 * w, y + 1.02 * h)]
+    b = [(x + w * (0.7 - 0.5 * s + 0.1 * np.sin(np.pi * s)), y + h * (0.18 + 0.62 * s)) for s in np.linspace(0, 1, 20)]
+    for pts in (a, b):
+        cv2.polylines(img, [np.int32(pts)], False, PEN, th, cv2.LINE_AA)
+
+
+def test_no_vote_box_on_coloured_band():
+    """Custom ballots may print the no-vote row on a saturated band (hot pink): the band is background, not ink."""
+    img = cv2.imread(str(pathlib.Path(__file__).parent / "assets" / "custom_ballot_band.png"))
+    res = ballot.analyze(img)
+    assert res["output"] == 0
+    boxes = {b["number"] if not b["is_no_vote"] else "nv": b["bbox"] for b in res["boxes"]}
+    for th in (3, 5, 8):
+        v = img.copy()
+        hand_x(v, boxes["nv"], th)
+        assert ballot.vote(v) == 0, th
+    v = img.copy()
+    hand_x(v, boxes[25])
+    assert ballot.vote(v) == 25
+    v = img.copy()
+    x, y, w, h = boxes["nv"]
+    cv2.circle(v, (x + w // 2, y + h // 2), h // 4, PEN, 5)
+    assert ballot.vote(v) == -1
+    v = img.copy()
+    hand_x(v, boxes["nv"])
+    cv2.putText(v, "hi", (200, y + h // 2), cv2.FONT_HERSHEY_SCRIPT_SIMPLEX, 1.5, PEN, 3)  # doodle on the band
+    assert ballot.vote(v) == -1

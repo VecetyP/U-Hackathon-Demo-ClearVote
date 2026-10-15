@@ -170,7 +170,11 @@ def ink_mask(gray, boxes, lines):
     """Binary ink with the boxes' printed border lines erased and strokes crossing a border re-bridged."""
     ys = np.concatenate([gray[y:y + h, x:x + w].ravel() for x, y, w, h in boxes])
     paper = np.percentile(ys, 90)
-    ink = (gray < paper - 45).astype(np.uint8) * 255
+    # ink = clearly darker than its *local* background: a closing wider than a pen stroke erases strokes but keeps
+    # region edges, so a coloured band behind a box (e.g. a hot-pink no-vote strip) is background, not ink
+    k = max(9, int(0.3 * np.median([h for *_, h in boxes])) | 1)
+    bg = np.minimum(cv2.morphologyEx(gray, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))), paper)
+    ink = (gray.astype(np.int16) < bg.astype(np.int16) - 45).astype(np.uint8) * 255
     band = np.zeros_like(ink)
     for x, y, w, h in boxes:
         cv2.rectangle(band, (x, y), (x + w - 1, y + h - 1), 255, 8 * BAND)  # wide enough for a few degrees of tilt
