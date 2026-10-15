@@ -1,0 +1,61 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body { margin: 0; font-family: sans-serif; background: transparent; }
+  .bar { display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+  button { padding: 6px 14px; border-radius: 6px; border: 1px solid #888; background: #f4f4f4; cursor: pointer; font-size: 14px; }
+  button.go { background: #c62828; color: #fff; border-color: #c62828; font-weight: 600; }
+  canvas { width: 100%; height: auto; touch-action: none; cursor: crosshair; display: block; border: 1px solid #888; }
+</style>
+</head>
+<body>
+<div class="bar">
+  <button class="go" id="analyze">Analyze</button>
+  <button id="undo">Undo</button>
+  <button id="clear">Clear</button>
+</div>
+<canvas id="c"></canvas>
+<script>
+// Minimal Streamlit component protocol (no build step / npm lib needed)
+const send = (type, data) => window.parent.postMessage(Object.assign({isStreamlitMessage: true, type}, data), "*");
+const cv = document.getElementById("c"), ctx = cv.getContext("2d");
+const bg = new Image();
+let strokes = [], cur = null, pen = 5, color = "#1f3fbf", loaded = "";
+
+function redraw() {
+  ctx.drawImage(bg, 0, 0);
+  ctx.strokeStyle = color; ctx.lineWidth = pen; ctx.lineCap = ctx.lineJoin = "round";
+  for (const s of strokes.concat(cur ? [cur] : [])) {
+    ctx.beginPath(); s.forEach((p, i) => i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])); ctx.stroke();
+  }
+}
+const pos = e => { const r = cv.getBoundingClientRect(); return [(e.clientX - r.left) * cv.width / r.width, (e.clientY - r.top) * cv.height / r.height]; };
+cv.addEventListener("pointerdown", e => { cv.setPointerCapture(e.pointerId); cur = [pos(e)]; redraw(); });
+cv.addEventListener("pointermove", e => { if (cur) { cur.push(pos(e)); redraw(); } });
+const end = () => { if (cur) { strokes.push(cur); cur = null; redraw(); } };
+cv.addEventListener("pointerup", end); cv.addEventListener("pointercancel", end);
+
+document.getElementById("undo").onclick = () => { strokes.pop(); redraw(); };
+document.getElementById("clear").onclick = () => { strokes = []; redraw(); };
+document.getElementById("analyze").onclick = () =>
+  send("streamlit:setComponentValue", {value: {image: cv.toDataURL("image/png"), t: Date.now()}, dataType: "json"});
+
+const fit = () => send("streamlit:setFrameHeight", {height: document.body.scrollHeight + 4});
+new ResizeObserver(fit).observe(document.body);
+
+window.addEventListener("message", e => {
+  if (e.data.type !== "streamlit:render") return;
+  const a = e.data.args;
+  pen = a.pen || pen; color = a.color || color;
+  if (a.image !== loaded) {  // new background image -> reset drawing
+    loaded = a.image; strokes = [];
+    bg.onload = () => { cv.width = bg.naturalWidth; cv.height = bg.naturalHeight; redraw(); fit(); };
+    bg.src = a.image;
+  }
+});
+send("streamlit:componentReady", {apiVersion: 1});
+</script>
+</body>
+</html>

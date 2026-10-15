@@ -11,7 +11,7 @@ MAX_SIDE = 1600
 LINE_FRAC = 0.035        # min straight-line length for box borders, fraction of image width
 BOX_ASPECT = (1.1, 4.0)  # w/h of a voting square
 BOX_AREA = (0.0008, 0.05)  # fraction of image area
-PRINT_MATCH = 0.85      # box contents this similar to another box are printed labels, not marks
+PRINT_MATCH = 0.75      # top cells this similar across columns are printed headers, not marks
 PAPER_FRAC = 0.55        # interior must be mostly bright paper
 
 
@@ -74,21 +74,39 @@ def detect_boxes(img, gray):
     return drop_printed(gray, boxes), raw_lines
 
 
+def columns(boxes):
+    """Group boxes into x-aligned columns, left to right, each sorted top to bottom."""
+    mw = np.median([b[2] for b in boxes]) if boxes else 0
+    cols = []
+    for b in sorted(boxes, key=lambda b: b[0] + b[2] / 2):
+        if cols and (b[0] + b[2] / 2) - (cols[-1][-1][0] + cols[-1][-1][2] / 2) < 0.5 * mw:
+            cols[-1].append(b)
+        else:
+            cols.append([b])
+    return [sorted(c, key=lambda b: b[1]) for c in cols]
+
+
 def drop_printed(gray, boxes):
-    """Header cells ("หมายเลขประจำตัวผู้สมัคร", "ช่องทำเครื่องหมาย") repeat identically in every column.
-    Hand marks never match pixel-for-pixel, so non-blank boxes whose content matches another box are print."""
-    # ponytail: a header printed only once would survive; add a "row above the first number cell" rule if seen
+    """Remove column-header cells ("หมายเลขประจำตัวผู้สมัคร", "ช่องทำเครื่องหมาย"):
+    - a column holding a single box is a label unless it is the bottom-most box (the no-vote box);
+    - the top cells of the columns whose print repeats across columns are headers. Only top cells are compared,
+      so a voter's two similar marks lower down still count (and void the ballot)."""
+    if len(boxes) < 3:
+        return boxes
+    lowest = max(boxes, key=lambda b: b[1])
+    cols = [c for c in columns(boxes) if len(c) > 1 or c[0] == lowest]
+    tops = [c[0] for c in cols]
     sig = []
-    for x, y, w, h in boxes:
+    for x, y, w, h in tops:
         m = int(0.12 * h)
         c = cv2.resize(gray[y + m:y + h - m, x + m:x + w - m], (64, 40), interpolation=cv2.INTER_AREA).astype(np.float32)
-        sig.append(c if c.std() > 12 else None)
+        sig.append(cv2.GaussianBlur(c, (3, 3), 0) if c.std() > 12 else None)
     dup = set()
-    for i in range(len(boxes)):
-        for j in range(i + 1, len(boxes)):
-            if sig[i] is not None and sig[j] is not None and                     cv2.matchTemplate(sig[i], sig[j], cv2.TM_CCOEFF_NORMED)[0, 0] > PRINT_MATCH:
-                dup |= {i, j}
-    return [b for i, b in enumerate(boxes) if i not in dup]
+    for i in range(len(tops)):
+        for j in range(i + 1, len(tops)):
+            if sig[i] is not None and sig[j] is not None and                     cv2.matchTemplate(sig[i], sig[j][3:-3, 3:-3], cv2.TM_CCOEFF_NORMED).max() > PRINT_MATCH:
+                dup |= {tops[i], tops[j]}
+    return [b for c in cols for b in c if b not in dup]
 
 
 def contains(o, b, tol=4):
@@ -270,15 +288,8 @@ def layout(boxes):
         own_column = all(abs((b[0] + b[2] / 2) - (low[0] + low[2] / 2)) > 0.5 * low[2] for b in rest)
         if isolated_below or own_column:
             no_vote, boxes = low, rest
-    mw = np.median([b[2] for b in boxes]) if boxes else 0
-    cols = []
-    for b in sorted(boxes, key=lambda b: b[0] + b[2] / 2):
-        if cols and (b[0] + b[2] / 2) - (cols[-1][-1][0] + cols[-1][-1][2] / 2) < 0.5 * mw:
-            cols[-1].append(b)
-        else:
-            cols.append([b])
     # ponytail: positional numbering (EC prints every slot sequentially); add digit OCR if ballots skip numbers
-    return [b for c in cols for b in sorted(c, key=lambda b: b[1])], no_vote
+    return [b for c in columns(boxes) for b in c], no_vote
 
 
 def number_strip(img, boxes, b):

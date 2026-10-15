@@ -158,8 +158,10 @@ def test_real_ballot_marks():
     img, _, boxes = real_boxes()
     one = img.copy()
     big_cross(one, boxes[507])
-    res = ballot.analyze(one, first_number=501)
-    assert res["verdict"] == ballot.VERDICT_VALID and res["voted_number"] == 507
+    for v in (one, cv2.resize(one, None, fx=0.4, fy=0.4, interpolation=cv2.INTER_AREA)):  # low-res: headers stay out
+        res = ballot.analyze(v, first_number=501)
+        assert res["verdict"] == ballot.VERDICT_VALID and res["voted_number"] == 507
+        assert res["counts"]["total"] == 21
 
     nv = img.copy()
     big_cross(nv, boxes["nv"])
