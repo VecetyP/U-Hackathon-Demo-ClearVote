@@ -88,7 +88,7 @@ obj["analysis"]["boxes_detected"], obj["analysis"]["warnings"]
 
 From the command line: `python ballot.py ballot.png` prints the main code. `ballot.analyze(img)` returns the full result (`output`, `verdict`, per-box labels, strays, overlay image) when you need more than the code.
 
-The candidate number is **read from the print** in the cells left of the X box. A ballot may have up to two cells there, a number cell and a name cell, in either order. They can sit flush against the box or with a gap, and the number can be dark-on-light or light-on-dark. Reading uses an offline digit matcher with templates from common fonts (`digits.npz`, built by `ballot.build_digit_templates()`), so there's no OCR dependency. If no number can be read, it falls back to position (column-major from *First candidate number*), and the app warns you.
+The candidate number is **read from the print** in the cells left of the X box. A ballot may have up to two cells there, a number cell and a name cell, in either order. They can sit flush against the box or with a gap, and the number can be dark-on-light or light-on-dark. The row is split into printed cells at their border lines. A cell counts as the number cell only if everything printed in it is a confident digit (1–4 digits, no leading zero), so letters in a name that look like digits (B~8, O~0, l~1) are never used. Reading uses an offline digit matcher with templates from common fonts (`digits.npz`, built by `ballot.build_digit_templates()`), so there's no OCR dependency. If no number can be read, it falls back to position (column-major from *First candidate number*), and the app warns you.
 
 ## Test bench
 
@@ -122,7 +122,7 @@ Every threshold is a named constant at the top of its section in `ballot.py`. Tu
 
 ## Known limits
 
-- The digit matcher is tuned for printed sans/serif fonts, Thai UI fonts and OpenCV fonts. Decorative or handwritten numbers fall back to position-based numbering.
+- The digit matcher is tuned for printed sans/serif fonts, Thai UI fonts and OpenCV fonts. On randomized custom ballots (number / name / box in any order, names full of digit-like letters, Thai names) it read about 98% of numbers and never read a wrong one; unread rows fall back to position-based numbering. Decorative or handwritten numbers also fall back.
 - A cross needs two strokes that clearly intersect: crossings sharper than about 45°, especially with a thick pen in a small box (phone photos), can be read as invalid. A "V" with a stroke through it at a gentle angle can still pass as a cross. Measured on randomized marks; see the stress numbers in the git history.
 - Stray marks drawn over dark print (the title band, the black number columns) are mostly missed, since dark ink on black barely shows. Marks smaller than about half a box on coloured panels, and black-pen marks on white paper, are also missed. A diff against a blank ballot would close these gaps.
 - On simulated ballpoint doodles, the detectors catch roughly 95% on white paper and 55–100% on coloured panels, depending on the photo. A photo of a screen is the weakest case. There are zero false strays on all clean test ballots.

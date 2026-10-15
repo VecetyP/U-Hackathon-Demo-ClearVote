@@ -686,6 +686,7 @@ def draw(img, res):
 # ---- printed candidate-number reader (offline digit templates, no OCR dependency) ----
 
 DIGITS_FILE = pathlib.Path(__file__).with_name("digits.npz")
+GLYPH_MIN_H = 0.12  # printed digits can be small next to big boxes (food ballot: 12 px vs 72 px boxes)
 DIGIT_SIM = 0.80     # min cosine similarity for a glyph to count as a digit
 DIGIT_FONTS = ["arial.ttf", "arialbd.ttf", "ARIALN.TTF", "tahoma.ttf", "tahomabd.ttf", "calibri.ttf", "calibrib.ttf",
                "segoeui.ttf", "segoeuib.ttf", "times.ttf", "timesbd.ttf", "verdana.ttf", "verdanab.ttf",
@@ -757,49 +758,84 @@ def row_strip(boxes, b, W):
 
 
 def read_number(gray, boxes, b):
-    """Read the printed candidate number in the cells left of mark box b (number cell and/or name cell,
-    any order, dark-on-light or light-on-dark). -> (number, confidence) or (None, 0)."""
+    """Read the printed candidate number in the cells left of mark box b. A row may hold just a number cell or a
+    number cell and a name cell (either order), flush or with gaps, dark-on-light or light-on-dark print.
+    The row strip is split into printed cells at their border lines; a cell is the number cell only if everything
+    printed in it (every mark at least 40% as tall as its tallest) is a confident digit - 1 to 4 of them, no leading
+    zero. So a dish / party name never contributes, even when its letters look like digits one by one (B~8, O~0, l~1),
+    and old-style figures of uneven height (Georgia) are read whole. -> (number, confidence) or (None, 0)."""
     x, y, w, h = b
     x0, x1 = row_strip(boxes, b, gray.shape[1])
     pad = int(0.1 * h)
     strip = gray[max(0, y - pad):y + h + pad, x0:x1]
     if strip.size == 0 or strip.shape[1] < 5:
         return None, 0.0
-    glyphs = []
-    for fg in (strip < cv2.threshold(strip, 0, 255, cv2.THRESH_OTSU)[0],      # dark print on light cells
-               strip > cv2.threshold(strip, 0, 255, cv2.THRESH_OTSU)[0]):     # light print in filled cells
-        n, _, st, _ = cv2.connectedComponentsWithStats(fg.astype(np.uint8) * 255, 8)
-        lab = cv2.connectedComponents(fg.astype(np.uint8), connectivity=8)[1]
+    thr = cv2.threshold(strip, 0, 255, cv2.THRESH_OTSU)[0]
+    marks = []  # (x, y, w, h, mask or None if it can't be a digit)
+    for fg in (strip < thr, strip > thr):  # dark print on light cells / light print in filled cells
+        n, lab, st, _ = cv2.connectedComponentsWithStats(fg.astype(np.uint8), connectivity=8)
         for i in range(1, n):
             gx, gy, gw, gh, a = st[i]
             touches = gx == 0 or gy == 0 or gx + gw >= strip.shape[1] or gy + gh >= strip.shape[0]
-            if touches or not (max(8, 0.18 * h) <= gh <= 0.95 * h) or gw > 1.1 * gh or not 0.15 * gw * gh < a < 0.74 * gw * gh:
-                continue  # cell borders, paper, solid blobs (logo discs), specks
+            if touches or not (max(5, 0.05 * h) <= gh <= 0.95 * h):
+                continue  # cell borders, specks
             m = (lab[gy:gy + gh, gx:gx + gw] == i).astype(np.uint8) * 255
             hull = cv2.contourArea(cv2.convexHull(cv2.findNonZero(m)))
-            if a > 0.9 * hull and gw > 0.5 * gh:
-                continue  # solid round blob (logo disc), not a digit; a plain '1' bar is narrow
-            glyphs.append((gx, gy, gw, gh, m))
-    # the hole of a light '0' shows up as a dark glyph inside it: keep only outermost glyphs
+            disc = a > 0.9 * hull and a > 0.7 * gw * gh and 0.75 < gw / gh < 1.33  # round solid blob (logo)
+            if gw > 1.1 * gh or not 0.15 * gw * gh < a < 0.85 * gw * gh or disc:
+                if gw <= 1.6 * gh and a < 0.85 * gw * gh:
+                    marks.append((gx, gy, gw, gh, None))  # letter-like but not a digit (a wide 'm', a logo glyph)
+                continue  # blank cell paper (wide and solid) is neither
+            marks.append((gx, gy, gw, gh, m))
+    # the hole of a light '0' shows up as a dark mark inside it: keep only outermost marks
     inside = lambda a, b: a is not b and b[0] <= a[0] and b[1] <= a[1] and a[0] + a[2] <= b[0] + b[2] and a[1] + a[3] <= b[1] + b[3]
-    glyphs = sorted((g for g in glyphs if not any(inside(g, o) for o in glyphs)), key=lambda g: g[0])
-    # group glyphs into words: a gap wider than ~0.6 glyph height starts a new word (number vs name cell)
-    words = []
-    for g in glyphs:
-        if words and g[0] - (words[-1][-1][0] + words[-1][-1][2]) < 0.6 * g[3] \
-                and abs(g[3] - words[-1][-1][3]) < 0.35 * g[3]:
-            words[-1].append(g)
-        else:
-            words.append([g])
+    marks = sorted((g for g in marks if not any(inside(g, o) for o in marks)), key=lambda g: g[0])
     best = (None, 0.0)
-    for word in words:
-        if len(word) > 4:
+    for c0, c1 in printed_cells(strip, thr, h):
+        cell = [g for g in marks if c0 <= g[0] + g[2] / 2 < c1]
+        if not cell:
             continue
-        reads = [read_digit(g[4]) for g in word]
+        tallest = max(g[3] for g in cell)
+        cell = [g for g in cell if g[3] >= 0.4 * tallest]  # drop i-dots / punctuation, keep short old-style digits
+        if tallest < max(8, GLYPH_MIN_H * h) or not 1 <= len(cell) <= 4 or any(g[4] is None for g in cell):
+            continue
+        reads = [read_digit(g[4]) for g in cell]
         conf = min(s for _, s in reads)
-        if conf >= DIGIT_SIM and (conf > best[1] or best[0] is None):
-            best = (int("".join(str(d) for d, _ in reads)), conf)
+        digits = "".join(str(d) for d, _ in reads)
+        if conf >= DIGIT_SIM and (len(digits) == 1 or digits[0] != "0") and conf > best[1]:
+            best = (int(digits), conf)
     return best
+
+
+def printed_cells(strip, thr, h):
+    """[(x0, x1)] column ranges of the printed cells in a row strip.
+    - a thin full-height dark line with light paper on both sides is a cell border (cut there);
+    - a wide dark region (a filled number cell with light digits) is a cell of its own. The dark gaps between its
+      digits have no paper beside them, so they are not mistaken for borders."""
+    col = (strip < thr).mean(0)
+    W = len(col)
+    k = max(3, int(0.3 * h))
+    smooth = np.convolve(col, np.ones(k) / k, mode="same")  # big light digits must not split a filled cell
+
+    def runs(mask):
+        out, x = [], 0
+        while x < W:
+            if mask[x]:
+                e = x
+                while e < W and mask[e]:
+                    e += 1
+                out.append((x, e))
+                x = e
+            else:
+                x += 1
+        return out
+    light = lambda a, b: a < b and col[a:b].mean() < 0.3
+    cuts = [(s, e) for s, e in runs(col > 0.6)
+            if e - s <= max(3, 0.15 * h) and light(max(0, s - 4), s) and light(e, min(W, e + 4))]
+    filled = [(s, e) for s, e in runs(smooth > 0.4) if e - s > 0.5 * h]
+    edges = sorted({0, W} | {v for c in cuts for v in c} | {v for f in filled for v in f})
+    cut_spans = set(cuts)
+    return [(a, b) for a, b in zip(edges, edges[1:]) if b - a > 2 and (a, b) not in cut_spans]
 
 
 if __name__ == "__main__":

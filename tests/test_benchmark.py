@@ -472,3 +472,13 @@ def test_real_photos_same_marks(name, doodles):
               if not any(x - 10 <= d[0] <= x + w + 10 and y - 10 <= d[1] <= y + h + 10 for x, y, w, h in res["strays"])]
     assert not missed and len(res["strays"]) == len(doodles), (missed, res["strays"])
     assert res["output"] == -1
+
+
+def test_food_ballot_number_name_box():
+    """Custom 'number | dish name | box' ballot: the number must come from the number cell, never from letters in
+    the dish name that look like digits one by one (B~8, l~1). A nonsense fallback start proves nothing is positional."""
+    assets = pathlib.Path(__file__).parent / "assets"
+    blank = ballot.analyze(cv2.imread(str(assets / "number_name_space.png")), first_number=9000)
+    assert [b["number"] for b in blank["boxes"] if not b["is_no_vote"]] == list(range(1, 27))
+    assert blank["output"] == 0 and not blank["strays"]
+    assert ballot.vote(cv2.imread(str(assets / "number_name_space_drawn.png")), first_number=9000) == 2
