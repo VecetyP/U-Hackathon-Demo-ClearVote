@@ -194,3 +194,8 @@ def test_real_ballot_marks():
     cv2.putText(stray, "somchai", (150, 1900), cv2.FONT_HERSHEY_SCRIPT_SIMPLEX, 2, PEN, 4)
     res = ballot.analyze(stray, first_number=501)
     assert res["verdict"] == ballot.VERDICT_INVALID and res["strays"]
+
+    header = one.copy()  # doodle over the white header / title banner, above the green panel
+    cv2.ellipse(header, (390, 540), (130, 45), 0, 0, 360, PEN, 5)
+    res = ballot.analyze(header, first_number=501)
+    assert res["verdict"] == ballot.VERDICT_INVALID and res["strays"]

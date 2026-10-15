@@ -300,6 +300,9 @@ def number_strip(img, boxes, b):
     return img[y:y + h, x0:x].copy()
 
 
+SHEET_PART = 0.05  # light regions this big (fraction of image) are part of the ballot sheet
+
+
 def stray_marks(img, boxes):
     """Pen-colored ink outside every (expanded) voting box -> list of bboxes."""
     # ponytail: assumes a blue/violet pen on a black/green/pink print; black-pen strays need a blank-ballot diff
@@ -319,14 +322,18 @@ def stray_marks(img, boxes):
 
 
 def paper_mask(hsv, boxes):
-    """The light sheet(s) the boxes sit on (white / light-green / pink paper), holes filled."""
+    """The ballot sheet: convex hull of the light regions holding boxes plus any large light region
+    (e.g. the white header above the black title banner), so strays anywhere on the paper count.
+    Small light islands outside the hull (logos / captions around a test infographic) stay out."""
     light = ((hsv[..., 2] > 150) & (hsv[..., 1] < 130)).astype(np.uint8)
     light = cv2.morphologyEx(light, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
     cnts, _ = cv2.findContours(light, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    big = SHEET_PART * light.size
+    keep = [c for c in cnts if cv2.contourArea(c) >= big or any(
+        cv2.pointPolygonTest(c, (float(x + w / 2), float(y + h / 2)), False) >= 0 for x, y, w, h in boxes)]
     mask = np.zeros(light.shape, np.uint8)
-    for c in cnts:
-        if any(cv2.pointPolygonTest(c, (float(x + w / 2), float(y + h / 2)), False) >= 0 for x, y, w, h in boxes):
-            cv2.drawContours(mask, [c], -1, 1, -1)
+    if keep:
+        cv2.fillConvexPoly(mask, cv2.convexHull(np.vstack(keep)), 1)
     return mask
 
 
