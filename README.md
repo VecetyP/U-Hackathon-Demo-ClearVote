@@ -10,7 +10,54 @@ streamlit run app.py      # test bench at http://localhost:8501
 pytest -q                 # 32-box benchmark + synthetic ballots
 ```
 
-## Integration: one number per ballot
+## Web app integration (HTTP endpoint)
+
+Use this when the web app isn't Python (e.g. a JavaScript front end or Node back end). It needs no extra dependencies beyond `requirements.txt`.
+
+```bash
+git clone https://github.com/VecetyP/U-Hackathon-Demo-ClearVote.git
+cd U-Hackathon-Demo-ClearVote
+pip install -r requirements.txt
+python server.py                    # http://127.0.0.1:8000  (add --host 0.0.0.0 to reach it from other machines)
+```
+
+**`POST /evaluate`**: send the ballot image, either as `multipart/form-data` (any file field) or as raw PNG/JPEG bytes. The optional `?first_number=N` is only used when a printed number can't be read. The response is the same object as `ballot.evaluate()`, with the picture base64-encoded:
+
+```json
+{
+  "output": 25,
+  "analysis": {
+    "verdict": "valid", "verdict_th": "บัตรดี",
+    "reason": "single valid cross in box #25",
+    "marks": [{"kind": "candidate_box", "number": 25, "number_source": "printed", "label": "VALID",
+               "reason": "single cross inside box", "confidence": 0.95, "bbox": [829, 689, 184, 113]}],
+    "boxes_detected": 7, "warnings": [],
+    "image": "iVBORw0KGgo..."
+  }
+}
+```
+
+Other responses: `400 {"error": ...}` if the body isn't an image, `413` above 20 MB, and `GET /health` returns `{"ok": true}`. CORS is open, so a browser page on another origin can call it directly.
+
+```js
+const form = new FormData();
+form.append("image", fileInput.files[0]);                 // or a canvas.toBlob(...) result
+const res = await fetch("http://127.0.0.1:8000/evaluate", { method: "POST", body: form });
+const { output, analysis } = await res.json();
+// output: printed number / 0 (no-vote) / -1 (invalid)
+imgEl.src = "data:image/png;base64," + analysis.image;   // analyzed picture
+analysis.marks.forEach(m => console.log(m.kind, m.number, m.label, m.reason));
+```
+
+```bash
+curl -F "image=@ballot.png" http://127.0.0.1:8000/evaluate
+```
+
+**Staying up to date:** the API shape above is kept backward compatible, so new fields may be added but existing ones won't be renamed or removed. To pick up pipeline improvements, run `git pull` and restart `python server.py`.
+
+The server has no authentication. It binds to localhost by default; put it behind your app's backend or a reverse proxy before exposing it publicly.
+
+## Integration: one number per ballot (Python)
 
 ```python
 import cv2, ballot

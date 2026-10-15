@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 import pytest
 
-sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))  # ballot.py, server.py
 import ballot  # noqa: E402
 
 ASSET = pathlib.Path(__file__).parent / "assets" / "benchmark_infographic.jpg"
@@ -342,3 +342,52 @@ def test_evaluate_object():
 
     obj = ballot.evaluate(img)
     assert obj["output"] == 0 and obj["analysis"]["marks"] == [] and obj["analysis"]["verdict"] == "no_vote"
+
+
+def test_http_endpoint():
+    """server.py: POST an image (raw or multipart form) -> evaluate() JSON with the picture base64-encoded."""
+    import base64
+    import json
+    import threading
+    import urllib.request
+    from http.server import ThreadingHTTPServer
+
+    import server
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        img = cv2.imread(str(pathlib.Path(__file__).parent / "assets" / "custom_ballot_gaps.png"))
+        boxes = {b["number"]: b["bbox"] for b in ballot.analyze(img)["boxes"] if not b["is_no_vote"]}
+        big_cross(img, boxes[25])
+        png = cv2.imencode(".png", img)[1].tobytes()
+
+        def post(body, ctype, path="/evaluate"):
+            req = urllib.request.Request(url + path, data=body, headers={"Content-Type": ctype}, method="POST")
+            try:
+                with urllib.request.urlopen(req) as r:
+                    return r.status, dict(r.headers), json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                return e.code, dict(e.headers), json.loads(e.read())
+
+        code, headers, obj = post(png, "image/png")
+        assert code == 200 and obj["output"] == 25 and headers["Access-Control-Allow-Origin"] == "*"
+        assert obj["analysis"]["verdict"] == "valid" and obj["analysis"]["marks"][0]["number"] == 25
+        assert base64.b64decode(obj["analysis"]["image"])[:8] == b"\x89PNG\r\n\x1a\n"
+
+        b = "----ballotTestBoundary"
+        form = (f"--{b}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"ballot.png\"\r\n"
+                f"Content-Type: image/png\r\n\r\n").encode() + png + f"\r\n--{b}--\r\n".encode()
+        code, _, obj = post(form, f"multipart/form-data; boundary={b}")
+        assert code == 200 and obj["output"] == 25
+
+        code, _, obj = post(b"not an image", "application/octet-stream")
+        assert code == 400 and "error" in obj
+
+        with urllib.request.urlopen(urllib.request.Request(url + "/evaluate", method="OPTIONS")) as r:
+            assert r.status == 204 and "POST" in r.headers["Access-Control-Allow-Methods"]
+        with urllib.request.urlopen(url + "/health") as r:
+            assert json.loads(r.read()) == {"ok": True}
+    finally:
+        srv.shutdown()
