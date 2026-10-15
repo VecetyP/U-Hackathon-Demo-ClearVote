@@ -10,7 +10,7 @@ import ballot
 
 ASSETS = pathlib.Path(__file__).parent / "tests" / "assets"
 BENCHMARK = ASSETS / "benchmark_infographic.jpg"
-SAMPLES = sorted(ASSETS.glob("sample_*.png"))
+SAMPLES = sorted(ASSETS.glob("sample*.png"))
 VERDICT_STYLE = {ballot.VERDICT_VALID: ("#0a7d32", "Valid ballot"),
                  ballot.VERDICT_INVALID: ("#c62828", "Invalid ballot"),
                  ballot.VERDICT_NOVOTE: ("#555", "No-vote ballot"),

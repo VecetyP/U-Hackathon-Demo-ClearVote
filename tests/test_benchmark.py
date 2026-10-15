@@ -124,3 +124,71 @@ def test_synthetic_layouts(make):
 def test_blank_sheet():
     res = ballot.analyze(np.full((800, 600, 3), 255, np.uint8))
     assert res["verdict"] == ballot.VERDICT_NOBOX and res["counts"]["total"] == 0
+
+
+# ---- real EC municipal ballot (green), blank scan ----
+
+REAL = pathlib.Path(__file__).parent / "assets" / "samplevoteFlat.png"
+
+
+def real_boxes():
+    """Box rects in original-image pixels, keyed by printed number ('nv' = no-vote)."""
+    img = cv2.imread(str(REAL))
+    res = ballot.analyze(img, first_number=501)
+    s = max(img.shape[:2]) / ballot.MAX_SIDE
+    return img, res, {("nv" if b["is_no_vote"] else b["number"]): tuple(int(v * s) for v in b["bbox"])
+                      for b in res["boxes"]}
+
+
+def big_cross(img, box):
+    x, y, w, h = box
+    cv2.line(img, (x + w // 5, y + h // 5), (x + 4 * w // 5, y + 4 * h // 5), PEN, 5)
+    cv2.line(img, (x + w // 5, y + 4 * h // 5), (x + 4 * w // 5, y + h // 5), PEN, 5)
+
+
+def test_real_blank_ballot_ignores_printed_headers():
+    _, res, boxes = real_boxes()
+    assert sorted(k for k in boxes if k != "nv") == list(range(501, 521))
+    assert "nv" in boxes, "no-vote mark area (bottom right) must be found"
+    assert all(b["label"] == "EMPTY" for b in res["boxes"]) and not res["strays"]
+    assert res["verdict"] == ballot.VERDICT_NOVOTE
+
+
+def test_real_ballot_marks():
+    img, _, boxes = real_boxes()
+    one = img.copy()
+    big_cross(one, boxes[507])
+    res = ballot.analyze(one, first_number=501)
+    assert res["verdict"] == ballot.VERDICT_VALID and res["voted_number"] == 507
+
+    nv = img.copy()
+    big_cross(nv, boxes["nv"])
+    assert ballot.analyze(nv, first_number=501)["verdict"] == ballot.VERDICT_NOVOTE
+
+    both = one.copy()
+    big_cross(both, boxes["nv"])
+    assert ballot.analyze(both, first_number=501)["verdict"] == ballot.VERDICT_INVALID
+
+    check = img.copy()
+    x, y, w, h = boxes[512]
+    cv2.polylines(check, [np.array([(x + 20, y + h // 2), (x + w // 3, y + h - 20), (x + w - 15, y + 15)])], False, PEN, 5)
+    assert ballot.analyze(check, first_number=501)["verdict"] == ballot.VERDICT_INVALID
+
+    for key in (507, "nv"):  # EC-invalid symbols, in a candidate box and in the wide no-vote area
+        x, y, w, h = boxes[key]
+        c = np.array([x + w / 2, y + h / 2])
+        star = np.int32([c + h / 3 * np.array([np.sin(a), -np.cos(a)]) for a in np.arange(5) * 4 * np.pi / 5])
+        shapes = [lambda v: cv2.polylines(v, [star], True, PEN, 4),
+                  lambda v: cv2.circle(v, tuple(np.int32(c)), h // 4, PEN, 5),
+                  lambda v: cv2.line(v, (x + w // 4, y + 3 * h // 4), (x + 3 * w // 4, y + h // 4), PEN, 5),
+                  lambda v: [cv2.line(v, tuple(np.int32(c - h / 3 * d)), tuple(np.int32(c + h / 3 * d)), PEN, 4)
+                             for d in (np.array([np.cos(a), np.sin(a)]) for a in np.deg2rad([0, 60, 120]))]]
+        for i, draw in enumerate(shapes):
+            v = img.copy()
+            draw(v)
+            assert ballot.analyze(v, first_number=501)["verdict"] == ballot.VERDICT_INVALID, (key, i)
+
+    stray = one.copy()
+    cv2.putText(stray, "somchai", (150, 1900), cv2.FONT_HERSHEY_SCRIPT_SIMPLEX, 2, PEN, 4)
+    res = ballot.analyze(stray, first_number=501)
+    assert res["verdict"] == ballot.VERDICT_INVALID and res["strays"]

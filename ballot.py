@@ -11,6 +11,7 @@ MAX_SIDE = 1600
 LINE_FRAC = 0.035        # min straight-line length for box borders, fraction of image width
 BOX_ASPECT = (1.1, 4.0)  # w/h of a voting square
 BOX_AREA = (0.0008, 0.05)  # fraction of image area
+PRINT_MATCH = 0.85      # box contents this similar to another box are printed labels, not marks
 PAPER_FRAC = 0.55        # interior must be mostly bright paper
 
 
@@ -57,6 +58,10 @@ def detect_boxes(img, gray):
         boxes.append((x, y, w, h))
     boxes = dedupe(boxes)
     # drop sub-cells (e.g. quadrants cut by a "+" that spans the box) and small text-like fragments
+    # ...but a frame whose inner cell fills most of it is a container (no-vote frame = label strip + mark area):
+    # keep the inner mark area instead
+    big_inner = lambda o: any(b != o and contains(o, b) and b[2] * b[3] > 0.4 * o[2] * o[3] for b in boxes)
+    boxes = [b for b in boxes if not big_inner(b)]
     boxes = [b for b in boxes if not any(o != b and contains(o, b) for o in boxes)]
     if boxes:
         mh = np.median([b[3] for b in boxes])
@@ -66,7 +71,24 @@ def detect_boxes(img, gray):
     boxes = [b for b in boxes if not any(
         abs((o[1] + o[3] / 2) - (b[1] + b[3] / 2)) < 0.3 * b[3] and abs(o[0] - (b[0] + b[2])) < 0.1 * b[2]
         for o in boxes if o != b)]
-    return boxes, raw_lines
+    return drop_printed(gray, boxes), raw_lines
+
+
+def drop_printed(gray, boxes):
+    """Header cells ("หมายเลขประจำตัวผู้สมัคร", "ช่องทำเครื่องหมาย") repeat identically in every column.
+    Hand marks never match pixel-for-pixel, so non-blank boxes whose content matches another box are print."""
+    # ponytail: a header printed only once would survive; add a "row above the first number cell" rule if seen
+    sig = []
+    for x, y, w, h in boxes:
+        m = int(0.12 * h)
+        c = cv2.resize(gray[y + m:y + h - m, x + m:x + w - m], (64, 40), interpolation=cv2.INTER_AREA).astype(np.float32)
+        sig.append(c if c.std() > 12 else None)
+    dup = set()
+    for i in range(len(boxes)):
+        for j in range(i + 1, len(boxes)):
+            if sig[i] is not None and sig[j] is not None and                     cv2.matchTemplate(sig[i], sig[j], cv2.TM_CCOEFF_NORMED)[0, 0] > PRINT_MATCH:
+                dup |= {i, j}
+    return [b for i, b in enumerate(boxes) if i not in dup]
 
 
 def contains(o, b, tol=4):
@@ -87,7 +109,7 @@ def dedupe(boxes):
     boxes = sorted(boxes, key=lambda b: -b[2] * b[3])
     keep = []
     for b in boxes:
-        if all(iou(b, k) < 0.5 for k in keep):
+        if all(iou(b, k) < 0.7 for k in keep):  # inner+outer contour of one border
             keep.append(b)
     return keep
 
@@ -97,11 +119,15 @@ MARGIN = 0.25     # crop margin around a box, fraction of box height (catches ma
 EMPTY_PX = 0.002   # total ink below this fraction of box area -> EMPTY
 SPECK = 0.004      # components below this fraction of box area are noise (EC accepts a stray dot)
 EXTRA_RATIO = 0.2  # extra components summing above this fraction of the main mark -> extra writing
+STD_ASPECT = 1.8  # wider boxes are squeezed to this w/h before classification
 STD_H = 70         # box crops are rescaled to this height before classification
+RING_STEPS = (1, 1.3, 1.6)  # ring radius multipliers tried in order
 RING = 0.09        # ring radius for crossing detection, fraction of box height
 RETRY_RINGS = (0.14, 0.17, 0.2)  # wider rings tried for the sketchy-stroke retry
 INSIDE_MIN = 0.75  # at least this share of the mark's ink must be inside the box
 BRANCH_SUPPORT = 0.25  # share of a crossing cluster that must agree on the branch count
+HOLE_MIN = 10      # enclosed regions smaller than this (px, standard box) are pen-overlap slivers
+MERGE_R = 1.6      # crossing clusters closer than this many ring radii are the same crossing
 CLUSTER_MIN = 15   # px in a crossing cluster to count as a real crossing
 
 
@@ -146,10 +172,12 @@ def box_crop(ink, boxes, b):
     p = 2 * BAND + 2
     inner = lab[y - y0 + p:y - y0 + h - p, x - x0 + p:x - x0 + w - p]
     crop[~np.isin(lab, np.unique(inner[inner > 0]))] = 0
-    # normalise scale so every threshold below is in "standard box" pixels
-    s = STD_H / h
-    crop = (cv2.resize(crop, None, fx=s, fy=s, interpolation=cv2.INTER_LINEAR) > 127).astype(np.uint8) * 255
-    return crop, (round((x - x0) * s), round((y - y0) * s), round(w * s), round(h * s))
+    # normalise to a standard box (height and aspect) so thresholds are in fixed pixels and a corner-to-corner
+    # X in a wide box (e.g. the no-vote area) is as steep as in a candidate box
+    sy = STD_H / h
+    sx = sy * min(1, STD_ASPECT * h / w)
+    crop = (cv2.resize(crop, None, fx=sx, fy=sy, interpolation=cv2.INTER_LINEAR) > 127).astype(np.uint8) * 255
+    return crop, (round((x - x0) * sx), round((y - y0) * sy), round(w * sx), round(h * sy))
 
 
 def classify(crop, rect):
@@ -166,8 +194,21 @@ def classify(crop, rect):
         return "INVALID", 0.85, "multiple marks in one box"
     if sum(comps[1:]) > EXTRA_RATIO * comps[0]:
         return "INVALID", 0.85, "extra marks or writing"
+    cnts, hier = cv2.findContours(crop, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    holes = sum(1 for cnt, hh in zip(cnts, hier[0]) if hh[3] >= 0 and cv2.contourArea(cnt) >= HOLE_MIN)
+    if holes >= 2:  # a cross encloses nothing (a loop-cross encloses one); stars / scribbles enclose several
+        return "INVALID", 0.85, "closed shapes (star / scribble)"
     sw = (crop > 0).sum() / max(1, (cv2.ximgproc.thinning(crop) > 0).sum())  # stroke width
-    clusters = crossing_clusters(crop, max(RING * h, 1.2 * sw))
+    # thin thick strokes first: two fat strokes crossing at a shallow angle overlap over a long stretch,
+    # which the skeleton turns into "><" (two forks + a bar) instead of one crossing
+    if (it := round((sw - 3) / 2)) > 0:
+        thin = cv2.erode(crop, cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3)), iterations=it)
+        if thin.any():
+            crop, sw = thin, sw - 2 * it
+    # smallest ring that sees a crossing: thick or shallow crosses need a slightly wider one
+    for f in RING_STEPS:
+        if clusters := crossing_clusters(crop, f * max(RING * h, 1.2 * sw)):
+            break
     if len(clusters) > 1:
         # sketchy pens: double/dashed strokes create near-duplicate crossings -> merge and look wider
         merged = cv2.morphologyEx(crop, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
@@ -197,12 +238,23 @@ def crossing_clusters(mask, R, strict=False):
     sel = c >= 4
     pts = np.zeros_like(sk)
     pts[yy[sel], xx[sel]] = 255
-    pts = cv2.dilate(pts, np.ones((3, 3), np.uint8))
+    k = 3
+    pts = cv2.dilate(pts, np.ones((k, k), np.uint8))
     n, cl, st, cen = cv2.connectedComponentsWithStats(pts, 8)
     lab = cl[yy[sel], xx[sel]]
     # highest branch count held by a solid share of the cluster: ignores skeleton spurs on thick / blurry strokes
     support = lambda v: int(v.max() if strict else max(u for u in np.unique(v) if (v >= u).mean() >= BRANCH_SUPPORT))
-    return [(support(c[sel][lab == j]), cen[j][0], cen[j][1]) for j in range(1, n) if st[j, 4] >= CLUSTER_MIN]
+    found = sorted(((st[j, 4], support(c[sel][lab == j]), cen[j][0], cen[j][1])
+                    for j in range(1, n) if st[j, 4] >= CLUSTER_MIN), reverse=True)
+    # a shallow X lights up a little way along its own arms; fold those into the strongest nearby crossing
+    out = []
+    for _, br, cx, cy in found:
+        near = [o for o in out if np.hypot(o[1] - cx, o[2] - cy) < MERGE_R * R]
+        if near:
+            near[0][0] = max(near[0][0], br)
+        else:
+            out.append([br, cx, cy])
+    return [tuple(o) for o in out]
 
 
 def layout(boxes):
@@ -213,7 +265,10 @@ def layout(boxes):
         low = max(boxes, key=lambda b: b[1])
         rest = [b for b in boxes if b != low]
         mh = np.median([b[3] for b in rest])
-        if low[1] - max(b[1] + b[3] for b in rest) > 0.8 * mh:
+        isolated_below = low[1] - max(b[1] + b[3] for b in rest) > 0.8 * mh
+        # EC 2569 ballots put it bottom-right, beside the grid: a column of its own
+        own_column = all(abs((b[0] + b[2] / 2) - (low[0] + low[2] / 2)) > 0.5 * low[2] for b in rest)
+        if isolated_below or own_column:
             no_vote, boxes = low, rest
     mw = np.median([b[2] for b in boxes]) if boxes else 0
     cols = []
@@ -238,7 +293,8 @@ def stray_marks(img, boxes):
     """Pen-colored ink outside every (expanded) voting box -> list of bboxes."""
     # ponytail: assumes a blue/violet pen on a black/green/pink print; black-pen strays need a blank-ballot diff
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    pen = ((hsv[..., 0] >= 95) & (hsv[..., 0] <= 140) & (hsv[..., 1] > 70) & (hsv[..., 2] < 235)).astype(np.uint8)
+    pen = ((hsv[..., 0] >= 95) & (hsv[..., 0] <= 140) & (hsv[..., 1] > 70)
+           & (hsv[..., 2] > 60) & (hsv[..., 2] < 235)).astype(np.uint8)  # near-black pixels have noise hue
     pen &= paper_mask(hsv, boxes)
     for x, y, w, h in boxes:
         m = int(MARGIN * h)
