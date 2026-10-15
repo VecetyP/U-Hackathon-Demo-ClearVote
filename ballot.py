@@ -404,6 +404,55 @@ def vote(img, first_number=1):
     return analyze(img, first_number)["output"]
 
 
+VERDICT_CODE = {VERDICT_VALID: "valid", VERDICT_INVALID: "invalid", VERDICT_NOVOTE: "no_vote", VERDICT_NOBOX: "no_ballot"}
+
+
+def evaluate(img, first_number=1):
+    """Integration entry point returning everything in one object:
+    {"output": int,                      # main result: printed number / 0 (no-vote) / -1 (invalid)
+     "analysis": {                       # secondary result
+        "verdict": "valid" | "invalid" | "no_vote" | "no_ballot", "verdict_th": "บัตรดี" ...,
+        "reason": str,                   # one line: why this verdict
+        "marks": [ {...}, ... ],         # one entry per mark found: in-box marks and stray marks
+        "boxes_detected": int, "warnings": [str],
+        "image": bytes,                  # analyzed picture (overlay), PNG; bboxes are in its pixel coords
+     }}"""
+    return to_object(analyze(img, first_number))
+
+
+def to_object(res):
+    """analyze() result -> the evaluate() object."""
+    marks = [{"kind": "no_vote_box" if b["is_no_vote"] else "candidate_box", "number": b["number"],
+              "number_source": b["number_source"], "label": b["label"], "reason": b["reason"],
+              "confidence": b["confidence"], "bbox": [int(v) for v in b["bbox"]]}
+             for b in res["boxes"] if b["label"] != "EMPTY"]
+    marks += [{"kind": "stray", "number": None, "number_source": None, "label": "INVALID",
+               "reason": "mark outside the voting boxes (voids the ballot)", "confidence": 0.9,
+               "bbox": [int(v) for v in s]} for s in res["strays"]]
+    return {"output": res["output"],
+            "analysis": {"verdict": VERDICT_CODE[res["verdict"]], "verdict_th": res["verdict"],
+                         "reason": verdict_reason(res, marks), "marks": marks,
+                         "boxes_detected": res["counts"]["total"], "warnings": res["warnings"],
+                         "image": cv2.imencode(".png", res["overlay"])[1].tobytes()}}
+
+
+def verdict_reason(res, marks):
+    tag = lambda m: "no-vote box" if m["kind"] == "no_vote_box" else f"box #{m['number']}"
+    if res["verdict"] == VERDICT_NOBOX:
+        return "no voting boxes found in the image"
+    if res["verdict"] == VERDICT_VALID:
+        return f"single valid cross in box #{res['voted_number']}"
+    if res["verdict"] == VERDICT_NOVOTE:
+        return "no-vote box marked" if marks else "no marks - all boxes empty"
+    why = [f"{tag(m)}: {m['reason']}" for m in marks if m["kind"] != "stray" and m["label"] == "INVALID"]
+    valid = [m for m in marks if m["label"] == "VALID"]
+    if len(valid) > 1:
+        why.append(f"{len(valid)} boxes marked ({', '.join(tag(m) for m in valid)})")
+    if res["strays"]:
+        why.append(f"{len(res['strays'])} stray mark(s) outside the boxes")
+    return "; ".join(why)
+
+
 def draw(img, res):
     out = img.copy()
     for r in res["boxes"]:

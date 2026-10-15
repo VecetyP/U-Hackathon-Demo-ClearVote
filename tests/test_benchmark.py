@@ -315,3 +315,30 @@ def test_no_vote_box_on_coloured_band():
     hand_x(v, boxes["nv"])
     cv2.putText(v, "hi", (200, y + h // 2), cv2.FONT_HERSHEY_SCRIPT_SIMPLEX, 1.5, PEN, 3)  # doodle on the band
     assert ballot.vote(v) == -1
+
+
+def test_evaluate_object():
+    """One object: main output + analysis (per-mark list, reason, analyzed picture as PNG bytes)."""
+    img = cv2.imread(str(pathlib.Path(__file__).parent / "assets" / "custom_ballot_gaps.png"))
+    boxes = {b["number"]: b["bbox"] for b in ballot.analyze(img)["boxes"] if not b["is_no_vote"]}
+
+    v = img.copy()
+    big_cross(v, boxes[25])
+    obj = ballot.evaluate(v)
+    assert obj["output"] == 25 == ballot.vote(v)
+    a = obj["analysis"]
+    assert a["verdict"] == "valid" and a["boxes_detected"] == 7
+    assert [(m["kind"], m["number"], m["label"]) for m in a["marks"]] == [("candidate_box", 25, "VALID")]
+    pic = cv2.imdecode(np.frombuffer(a["image"], np.uint8), cv2.IMREAD_COLOR)
+    assert a["image"][:8] == b"\x89PNG\r\n\x1a\n" and pic.shape[:2] == img.shape[:2]  # bboxes are in pic coords
+
+    big_cross(v, boxes[3])
+    cv2.putText(v, "hi", (150, 1400), cv2.FONT_HERSHEY_SCRIPT_SIMPLEX, 1.5, PEN, 3)
+    obj = ballot.evaluate(v)
+    assert obj["output"] == -1 and obj["analysis"]["verdict"] == "invalid"
+    kinds = sorted(m["kind"] for m in obj["analysis"]["marks"])
+    assert kinds == ["candidate_box", "candidate_box", "stray"]
+    assert "2 boxes marked" in obj["analysis"]["reason"] and "stray" in obj["analysis"]["reason"]
+
+    obj = ballot.evaluate(img)
+    assert obj["output"] == 0 and obj["analysis"]["marks"] == [] and obj["analysis"]["verdict"] == "no_vote"

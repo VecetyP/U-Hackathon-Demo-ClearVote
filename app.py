@@ -70,6 +70,12 @@ def show_summary(res):
         st.success("Stray marks outside boxes: NO")
     for w in res["warnings"]:
         st.warning(w)
+    obj = ballot.to_object(res)
+    with st.expander("Integration object - ballot.evaluate(img)", expanded=False):
+        st.json({"output": obj["output"],
+                 "analysis": {**obj["analysis"], "image": f"<{len(obj['analysis']['image']):,} bytes PNG>"}})
+        st.download_button("Download analyzed picture (PNG)", obj["analysis"]["image"], "analyzed_ballot.png",
+                           "image/png", key=f"dl_{id(res)}")
     with st.expander("Per-box detail", expanded=False):
         st.dataframe(pd.DataFrame([{"#": "no-vote" if b["is_no_vote"] else str(b["number"]), "number from": b["number_source"] or "",
                                     "label": b["label"],

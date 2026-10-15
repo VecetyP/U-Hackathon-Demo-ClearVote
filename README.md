@@ -23,7 +23,23 @@ code = ballot.vote(cv2.imread("ballot.png"))   # or cv2.imdecode(bytes, cv2.IMRE
 | Valid, chose not to vote (no-vote box marked, or every box empty) | `0` |
 | Invalid (บัตรเสีย) or no ballot found | `-1` |
 
-From the command line: `python ballot.py ballot.png` prints the same code. `ballot.analyze(img)` returns the full result (`output`, `verdict`, per-box labels, strays, overlay image) when you need more than the code.
+Need the details too? `ballot.evaluate(img)` returns everything in one object:
+
+```python
+obj = ballot.evaluate(img)
+obj["output"]                      # main result: number / 0 / -1 (same as vote())
+obj["analysis"]["verdict"]         # "valid" | "invalid" | "no_vote" | "no_ballot"  (verdict_th: บัตรดี / บัตรเสีย / ...)
+obj["analysis"]["reason"]          # e.g. "2 boxes marked (box #3, box #12); 1 stray mark(s) outside the boxes"
+obj["analysis"]["marks"]           # one entry per mark found (empty boxes left out):
+#   {"kind": "candidate_box" | "no_vote_box" | "stray", "number": 25, "number_source": "printed" | "position",
+#    "label": "VALID" | "INVALID", "reason": "single cross inside box", "confidence": 0.95, "bbox": [x, y, w, h]}
+obj["analysis"]["image"]           # analyzed picture (colored boxes + labels) as raw PNG bytes
+obj["analysis"]["boxes_detected"], obj["analysis"]["warnings"]
+```
+
+`bbox` values are pixel coordinates in the analyzed picture. Images larger than 1600 px on their longest side are scaled down first, so for big photos the coordinates are in the scaled picture, not the original. Everything except `image` is JSON-ready; base64-encode the PNG if you need to send it as JSON.
+
+From the command line: `python ballot.py ballot.png` prints the main code. `ballot.analyze(img)` returns the full result (`output`, `verdict`, per-box labels, strays, overlay image) when you need more than the code.
 
 The candidate number is **read from the print** in the cells left of the X box. A ballot may have up to two cells there, a number cell and a name cell, in either order. They can sit flush against the box or with a gap, and the number can be dark-on-light or light-on-dark. Reading uses an offline digit matcher with templates from common fonts (`digits.npz`, built by `ballot.build_digit_templates()`), so there's no OCR dependency. If no number can be read, it falls back to position (column-major from *First candidate number*), and the app warns you.
 
