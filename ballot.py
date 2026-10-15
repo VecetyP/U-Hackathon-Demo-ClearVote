@@ -1,4 +1,7 @@
 """Thai ballot verification engine: box detection, mark classification, stray ink, verdict."""
+import pathlib
+import sys
+
 import cv2
 import numpy as np
 
@@ -12,6 +15,7 @@ LINE_FRAC = 0.035        # min straight-line length for box borders, fraction of
 BOX_ASPECT = (1.1, 4.0)  # w/h of a voting square
 BOX_AREA = (0.0008, 0.05)  # fraction of image area
 PRINT_MATCH = 0.75      # top cells this similar across columns are printed headers, not marks
+LABEL_COLUMN = 0.7       # columns with black print in this share of cells are name/number labels
 PAPER_FRAC = 0.55        # interior must be mostly bright paper
 
 
@@ -71,7 +75,20 @@ def detect_boxes(img, gray):
     boxes = [b for b in boxes if not any(
         abs((o[1] + o[3] / 2) - (b[1] + b[3] / 2)) < 0.3 * b[3] and abs(o[0] - (b[0] + b[2])) < 0.1 * b[2]
         for o in boxes if o != b)]
-    return drop_printed(gray, boxes), raw_lines
+    return drop_label_columns(img, drop_printed(gray, boxes)), raw_lines
+
+
+def drop_label_columns(img, boxes):
+    """Custom ballots may put candidate-number / name cells (white, bordered) left of the X box with a gap.
+    A column whose cells mostly carry black print is a label column: a voter marks one box, not most of them."""
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    printed = lambda b: ((hsv[b[1] + b[3] // 6:b[1] + b[3] * 5 // 6, b[0] + b[2] // 6:b[0] + b[2] * 5 // 6, 2] < 110)
+                         & (hsv[b[1] + b[3] // 6:b[1] + b[3] * 5 // 6, b[0] + b[2] // 6:b[0] + b[2] * 5 // 6, 1] < 90)).mean() > 0.01
+    drop = set()
+    for c in columns(boxes):
+        if len(c) >= 3 and sum(map(printed, c)) >= LABEL_COLUMN * len(c):
+            drop |= set(c)
+    return [b for b in boxes if b not in drop]
 
 
 def columns(boxes):
@@ -283,7 +300,11 @@ def layout(boxes):
         low = max(boxes, key=lambda b: b[1])
         rest = [b for b in boxes if b != low]
         mh = np.median([b[3] for b in rest])
-        isolated_below = low[1] - max(b[1] + b[3] for b in rest) > 0.8 * mh
+        above = [b for b in rest if abs((b[0] + b[2] / 2) - (low[0] + low[2] / 2)) < 0.5 * low[2]]
+        gaps = np.diff(sorted(b[1] for b in above)) - mh if len(above) > 1 else []
+        gap = low[1] - max(b[1] + b[3] for b in rest)
+        # set apart below the grid: clearly more space above it than between candidate rows
+        isolated_below = gap > 0.8 * mh or (len(gaps) and gap > 1.6 * max(np.median(gaps), 2) and gap > 0.25 * mh)
         # EC 2569 ballots put it bottom-right, beside the grid: a column of its own
         own_column = all(abs((b[0] + b[2] / 2) - (low[0] + low[2] / 2)) > 0.5 * low[2] for b in rest)
         if isolated_below or own_column:
@@ -294,10 +315,8 @@ def layout(boxes):
 
 def number_strip(img, boxes, b):
     """Row strip left of box b (number / logo / party name) for a human to confirm the printed number."""
-    x, y, w, h = b
-    left = [o[0] + o[2] for o in boxes if o[0] + o[2] <= x and abs(o[1] - y) < 0.5 * h]
-    x0 = max(left + [0, int(x - 4 * w)])
-    return img[y:y + h, x0:x].copy()
+    x0, x1 = row_strip(boxes, b, img.shape[1])
+    return img[b[1]:b[1] + b[3], x0:x1].copy()
 
 
 SHEET_PART = 0.05  # light regions this big (fraction of image) are part of the ballot sheet
@@ -350,8 +369,13 @@ def analyze(img, first_number=1):
     ink = ink_mask(gray, boxes, lines)
     for i, b in enumerate(boxes):
         label, conf, reason = classify(*box_crop(ink, boxes, b))
-        res["boxes"].append(dict(bbox=b, number=None if b == no_vote else first_number + i,
-                                 is_no_vote=b == no_vote, label=label, confidence=conf, reason=reason))
+        number, source = None, None
+        if b != no_vote:
+            # printed number in the cells left of the box; position-based numbering only as a fallback
+            number, _ = read_number(gray, boxes, b)
+            number, source = (number, "printed") if number is not None else (first_number + i, "position")
+        res["boxes"].append(dict(bbox=b, number=number, number_source=source, is_no_vote=b == no_vote,
+                                 label=label, confidence=conf, reason=reason))
     res["strays"] = stray_marks(img, boxes)
     counts = {k: sum(r["label"] == k for r in res["boxes"]) for k in COLORS}
     res["counts"] = dict(total=len(boxes), **counts)
@@ -364,8 +388,16 @@ def analyze(img, first_number=1):
         res["verdict"] = VERDICT_VALID
         res["voted_number"] = valid[0]["number"]
         res["number_crop"] = number_strip(img, boxes, valid[0]["bbox"])
+    res["output"] = {VERDICT_VALID: res["voted_number"], VERDICT_NOVOTE: 0}.get(res["verdict"], -1)
     res["overlay"] = draw(img, res)
     return res
+
+
+def vote(img, first_number=1):
+    """Integration entry point (BGR image, e.g. cv2.imread / cv2.imdecode) -> int:
+    the chosen candidate's printed number for a valid ballot, 0 for a valid no-vote ballot
+    (no-vote box marked, or every box left empty), -1 for an invalid ballot (บัตรเสีย) or no ballot found."""
+    return analyze(img, first_number)["output"]
 
 
 def draw(img, res):
@@ -383,3 +415,132 @@ def draw(img, res):
         cv2.rectangle(out, (x - 4, y - 4), (x + w + 4, y + h + 4), RED, 2)
         cv2.putText(out, "STRAY", (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, RED, 1, cv2.LINE_AA)
     return out
+
+
+# ---- printed candidate-number reader (offline digit templates, no OCR dependency) ----
+
+DIGITS_FILE = pathlib.Path(__file__).with_name("digits.npz")
+DIGIT_SIM = 0.80     # min cosine similarity for a glyph to count as a digit
+DIGIT_FONTS = ["arial.ttf", "arialbd.ttf", "ARIALN.TTF", "tahoma.ttf", "tahomabd.ttf", "calibri.ttf", "calibrib.ttf",
+               "segoeui.ttf", "segoeuib.ttf", "times.ttf", "timesbd.ttf", "verdana.ttf", "verdanab.ttf",
+               "cour.ttf", "courbd.ttf", "consola.ttf", "georgia.ttf", "trebuc.ttf", "LeelawUI.ttf", "LeelaUIb.ttf",
+               "leelawad.ttf", "leelawdb.ttf", "angsana.ttc", "cordia.ttc", "browalia.ttc", "upcdl.ttf"]
+
+
+def digit_vec(mask):
+    """Binary glyph -> L2-normalised 24x24 vector (glyph centred in a square, aspect kept)."""
+    ys, xs = np.nonzero(mask)
+    g = mask[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+    s = max(g.shape)
+    sq = np.zeros((s, s), np.uint8)
+    oy, ox = (s - g.shape[0]) // 2, (s - g.shape[1]) // 2
+    sq[oy:oy + g.shape[0], ox:ox + g.shape[1]] = g
+    v = cv2.GaussianBlur(cv2.resize(sq, (24, 24), interpolation=cv2.INTER_AREA).astype(np.float32), (3, 3), 0).ravel()
+    return v / (np.linalg.norm(v) + 1e-6)
+
+
+def build_digit_templates(font_dir="C:/Windows/Fonts"):
+    """One-off: render 0-9 in common ballot fonts + OpenCV Hershey fonts -> digits.npz (committed)."""
+    from PIL import Image, ImageDraw, ImageFont
+    vecs, labels = [], []
+
+    def add(mask, d):
+        for m in (mask, cv2.dilate(mask, np.ones((3, 3), np.uint8)), cv2.erode(mask, np.ones((2, 2), np.uint8))):
+            if m.any():
+                vecs.append(digit_vec(m))
+                labels.append(d)
+    for f in DIGIT_FONTS:
+        p = pathlib.Path(font_dir) / f
+        if not p.exists():
+            continue
+        font = ImageFont.truetype(str(p), 64)
+        for d in range(10):
+            im = Image.new("L", (80, 100), 0)
+            ImageDraw.Draw(im).text((10, 5), str(d), fill=255, font=font)
+            add((np.array(im) > 127).astype(np.uint8) * 255, d)
+    for face in (cv2.FONT_HERSHEY_SIMPLEX, cv2.FONT_HERSHEY_DUPLEX, cv2.FONT_HERSHEY_COMPLEX, cv2.FONT_HERSHEY_TRIPLEX):
+        for th in (2, 4, 6):
+            for d in range(10):
+                im = np.zeros((100, 80), np.uint8)
+                cv2.putText(im, str(d), (10, 80), face, 2.2, 255, th)
+                add(im, d)
+    np.savez_compressed(DIGITS_FILE, vecs=np.array(vecs, np.float16), labels=np.array(labels, np.int8))
+    return len(vecs)
+
+
+_TEMPLATES = None
+
+
+def read_digit(mask):
+    """-> (digit, similarity) for one binary glyph."""
+    global _TEMPLATES
+    if _TEMPLATES is None:
+        z = np.load(DIGITS_FILE)
+        _TEMPLATES = z["vecs"].astype(np.float32), z["labels"]
+    vecs, labels = _TEMPLATES
+    sims = vecs @ digit_vec(mask)
+    i = int(np.argmax(sims))
+    return int(labels[i]), float(sims[i])
+
+
+def row_strip(boxes, b, W):
+    """x-range left of box b up to the previous mark box on the same row (or 6 box widths / page edge)."""
+    x, y, w, h = b
+    left = [o[0] + o[2] for o in boxes if o[0] + o[2] <= x and abs((o[1] + o[3] / 2) - (y + h / 2)) < 0.5 * h]
+    return max(left + [0, int(x - 6 * w)]), x
+
+
+def read_number(gray, boxes, b):
+    """Read the printed candidate number in the cells left of mark box b (number cell and/or name cell,
+    any order, dark-on-light or light-on-dark). -> (number, confidence) or (None, 0)."""
+    x, y, w, h = b
+    x0, x1 = row_strip(boxes, b, gray.shape[1])
+    pad = int(0.1 * h)
+    strip = gray[max(0, y - pad):y + h + pad, x0:x1]
+    if strip.size == 0 or strip.shape[1] < 5:
+        return None, 0.0
+    glyphs = []
+    for fg in (strip < cv2.threshold(strip, 0, 255, cv2.THRESH_OTSU)[0],      # dark print on light cells
+               strip > cv2.threshold(strip, 0, 255, cv2.THRESH_OTSU)[0]):     # light print in filled cells
+        n, _, st, _ = cv2.connectedComponentsWithStats(fg.astype(np.uint8) * 255, 8)
+        lab = cv2.connectedComponents(fg.astype(np.uint8), connectivity=8)[1]
+        for i in range(1, n):
+            gx, gy, gw, gh, a = st[i]
+            touches = gx == 0 or gy == 0 or gx + gw >= strip.shape[1] or gy + gh >= strip.shape[0]
+            if touches or not (max(8, 0.18 * h) <= gh <= 0.95 * h) or gw > 1.1 * gh or not 0.15 * gw * gh < a < 0.74 * gw * gh:
+                continue  # cell borders, paper, solid blobs (logo discs), specks
+            m = (lab[gy:gy + gh, gx:gx + gw] == i).astype(np.uint8) * 255
+            hull = cv2.contourArea(cv2.convexHull(cv2.findNonZero(m)))
+            if a > 0.9 * hull and gw > 0.5 * gh:
+                continue  # solid round blob (logo disc), not a digit; a plain '1' bar is narrow
+            glyphs.append((gx, gy, gw, gh, m))
+    # the hole of a light '0' shows up as a dark glyph inside it: keep only outermost glyphs
+    inside = lambda a, b: a is not b and b[0] <= a[0] and b[1] <= a[1] and a[0] + a[2] <= b[0] + b[2] and a[1] + a[3] <= b[1] + b[3]
+    glyphs = sorted((g for g in glyphs if not any(inside(g, o) for o in glyphs)), key=lambda g: g[0])
+    # group glyphs into words: a gap wider than ~0.6 glyph height starts a new word (number vs name cell)
+    words = []
+    for g in glyphs:
+        if words and g[0] - (words[-1][-1][0] + words[-1][-1][2]) < 0.6 * g[3] \
+                and abs(g[3] - words[-1][-1][3]) < 0.35 * g[3]:
+            words[-1].append(g)
+        else:
+            words.append([g])
+    best = (None, 0.0)
+    for word in words:
+        if len(word) > 4:
+            continue
+        reads = [read_digit(g[4]) for g in word]
+        conf = min(s for _, s in reads)
+        if conf >= DIGIT_SIM and (conf > best[1] or best[0] is None):
+            best = (int("".join(str(d) for d, _ in reads)), conf)
+    return best
+
+
+if __name__ == "__main__":
+    # python ballot.py ballot.png [first_number]  -> prints the vote code (number / 0 / -1)
+    if len(sys.argv) < 2:
+        sys.exit("usage: python ballot.py <image> [first_number]")
+    image = cv2.imread(sys.argv[1])
+    if image is None:
+        sys.exit(f"cannot read image: {sys.argv[1]}")
+    print(vote(image, int(sys.argv[2]) if len(sys.argv) > 2 else 1))

@@ -24,8 +24,11 @@ draw_canvas = components.declare_component("ballot_canvas", path=str(ROOT / "can
 
 
 @st.cache_data
-def blank_ballot_url():
-    img = cv2.imread(str(BLANK_BALLOT))
+def ballot_url(data=None):
+    """Canvas background as a data URL: the uploaded image bytes, or the blank EC ballot."""
+    img = cv2.imread(str(BLANK_BALLOT)) if data is None else cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        return None
     s = ballot.MAX_SIDE / max(img.shape[:2])
     if s < 1:
         img = cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
@@ -38,11 +41,19 @@ def decode_data_url(url):
 
 def show_summary(res):
     color, english = VERDICT_STYLE[res["verdict"]]
+    st.markdown(f"<div style='border:2px solid {color};border-radius:10px;padding:8px 14px;margin-bottom:8px'>"
+                f"Pipeline output: <code style='font-size:1.6rem'>{res['output']}</code>"
+                f"<span style='opacity:.7'> &nbsp;(number = valid vote, 0 = no-vote, -1 = invalid)</span></div>",
+                unsafe_allow_html=True)
     st.markdown(f"<div style='background:{color};color:#fff;padding:18px;border-radius:10px;text-align:center'>"
                 f"<div style='font-size:2.4rem;font-weight:700'>{res['verdict']}</div>"
                 f"<div>{english}</div></div>", unsafe_allow_html=True)
     if res["voted_number"] is not None:
         st.subheader(f"เลือกหมายเลข {res['voted_number']}  (voted for #{res['voted_number']})")
+        src = next(b["number_source"] for b in res["boxes"] if b["number"] == res["voted_number"])
+        if src == "position":
+            st.warning("Couldn't read a printed number next to the box - numbered by position "
+                       "(set 'First candidate number' if this is wrong).")
         if res["number_crop"] is not None and res["number_crop"].size:
             st.image(cv2.cvtColor(res["number_crop"], cv2.COLOR_BGR2RGB),
                      caption="Printed row next to the marked box - confirm the number", width=320)
@@ -60,7 +71,8 @@ def show_summary(res):
     for w in res["warnings"]:
         st.warning(w)
     with st.expander("Per-box detail", expanded=False):
-        st.dataframe(pd.DataFrame([{"#": "no-vote" if b["is_no_vote"] else str(b["number"]), "label": b["label"],
+        st.dataframe(pd.DataFrame([{"#": "no-vote" if b["is_no_vote"] else str(b["number"]), "number from": b["number_source"] or "",
+                                    "label": b["label"],
                                     "confidence": b["confidence"], "reason": b["reason"],
                                     "bbox (x,y,w,h)": str(b["bbox"])} for b in res["boxes"]]),
                      hide_index=True, use_container_width=True)
@@ -80,15 +92,25 @@ st.caption("ตรวจบัตรเลือกตั้ง: กาถูก
 draw_tab, file_tab = st.tabs(["Draw on ballot", "Upload / benchmark / samples"])
 
 with draw_tab:
-    st.caption("Draw marks with the mouse on the blank EC ballot, then press **Analyze**. "
-               "Undo removes the last stroke; Clear wipes the ballot.")
-    pen = st.slider("Pen width (px)", 2, 12, 5)
+    st.caption("Draw marks with the mouse, then press **Analyze**. Undo removes the last stroke; Clear wipes the "
+               "ballot. Upload your own ballot image to draw on it instead of the EC sample.")
+    d1, d2, d3 = st.columns([3, 1, 1])
+    custom = d1.file_uploader("Custom ballot to draw on (optional)", type=["png", "jpg", "jpeg"], key="custom_bg")
+    pen = d2.slider("Pen width (px)", 2, 12, 5)
+    first_d = d3.number_input("First candidate number", min_value=0, value=1 if custom else 501, step=1,
+                              help="Only used when a printed number can't be read next to a box.",
+                              key=f"first_draw_{bool(custom)}")  # default follows the background
+    bg = ballot_url(custom.getvalue() if custom else None)
+    if bg is None:
+        st.error("Could not read that file as an image.")
+        st.stop()
     c_draw, c_res = st.columns(2)
     with c_draw:
-        drawn = draw_canvas(image=blank_ballot_url(), pen=pen, color="#1f3fbf", key="canvas", default=None)
+        drawn = draw_canvas(image=bg, pen=pen, color="#1f3fbf", default=None,
+                            key=f"canvas_{custom.file_id if custom else 'ec'}")  # new image -> fresh canvas
     with c_res:
         if drawn:
-            res = ballot.analyze(decode_data_url(drawn["image"]), first_number=501)
+            res = ballot.analyze(decode_data_url(drawn["image"]), first_number=int(first_d))
             st.image(cv2.cvtColor(res["overlay"], cv2.COLOR_BGR2RGB), use_container_width=True)
             show_summary(res)
         else:
@@ -98,7 +120,7 @@ with file_tab:
     c1, c2, c3 = st.columns([3, 1, 1])
     upload = c1.file_uploader("Upload a ballot or test grid", type=["png", "jpg", "jpeg"])
     first = c2.number_input("First candidate number", min_value=0, value=1, step=1,
-                            help="Printed number of the first mark box (EC sample ballots start at 501).")
+                            help="Only used when a printed number can't be read next to a box.")
     if c3.button("Run benchmark (32-box EC infographic)", use_container_width=True):
         st.session_state.src = "benchmark"
     sample = c3.selectbox("...or a sample ballot", ["-"] + [p.name for p in SAMPLES])

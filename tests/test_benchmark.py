@@ -160,7 +160,7 @@ def test_real_ballot_marks():
     big_cross(one, boxes[507])
     for v in (one, cv2.resize(one, None, fx=0.4, fy=0.4, interpolation=cv2.INTER_AREA)):  # low-res: headers stay out
         res = ballot.analyze(v, first_number=501)
-        assert res["verdict"] == ballot.VERDICT_VALID and res["voted_number"] == 507
+        assert res["verdict"] == ballot.VERDICT_VALID and res["voted_number"] == 507 and res["output"] == 507
         assert res["counts"]["total"] == 21
 
     nv = img.copy()
@@ -199,3 +199,79 @@ def test_real_ballot_marks():
     cv2.ellipse(header, (390, 540), (130, 45), 0, 0, 360, PEN, 5)
     res = ballot.analyze(header, first_number=501)
     assert res["verdict"] == ballot.VERDICT_INVALID and res["strays"]
+
+
+# ---- custom ballots: printed numbers are not sequential, name/number cells left of the X box ----
+
+CUSTOM = {"custom_ballot_gaps.png": [3, 7, 12, 25, 31, 48], "custom_ballot_flush.png": [101, 5, 77, 9, 60, 2]}
+NAMES = ["นายสมชาย ใจดี", "นางสาวมาลี รักไทย", "นายประยุทธ์ มั่นคง", "นางวันดี สุขใจ", "นายอนันต์ ทองคำ", "นายกิตติ ศรีสุข"]
+
+
+def make_custom_ballots(font_dir="C:/Windows/Fonts"):
+    """One-off generator for the committed custom ballot assets (needs Windows Thai fonts)."""
+    from PIL import Image, ImageDraw, ImageFont
+    thai = ImageFont.truetype(f"{font_dir}/LeelawUI.ttf", 34)
+    num = ImageFont.truetype(f"{font_dir}/arialbd.ttf", 46)
+    for fname, numbers in CUSTOM.items():
+        flush = "flush" in fname
+        im = Image.new("RGB", (1200, 1500), "white")
+        d = ImageDraw.Draw(im)
+        d.text((330, 50), "บัตรเลือกตั้ง (ตัวอย่าง)", font=ImageFont.truetype(f"{font_dir}/LeelaUIb.ttf", 48), fill="black")
+        d.text((120, 140), "ทำเครื่องหมาย X ในช่องทำเครื่องหมาย ได้เพียงช่องเดียว", font=thai, fill="black")
+        for r, (n, name) in enumerate(zip(numbers, NAMES)):
+            y = 240 + r * 150
+            cells = [("name", 470), ("num", 160)] if flush else [("num", 160), ("name", 470)]
+            x = 120
+            for kind, cw in cells:
+                d.rectangle([x, y, x + cw, y + 110], outline="black", width=4)
+                if kind == "num":
+                    d.text((x + cw // 2, y + 55), str(n), font=num, fill="black", anchor="mm")
+                else:
+                    d.text((x + 20, y + 55), name, font=thai, fill="black", anchor="lm")
+                x += cw + (0 if flush else 40)
+            d.rectangle([x, y, x + 180, y + 110], outline="black", width=4)
+        y = 240 + len(numbers) * 150 + 40
+        d.text((120, y + 35), "ไม่ประสงค์ลงคะแนน", font=thai, fill="black")
+        d.rectangle([840, y, 1020, y + 110], outline="black", width=4)
+        im.save(pathlib.Path(__file__).parent / "assets" / fname)
+
+
+
+@pytest.mark.parametrize("fname", CUSTOM)
+def test_custom_ballot_output_codes(fname):
+    numbers = CUSTOM[fname]
+    img = cv2.imread(str(pathlib.Path(__file__).parent / "assets" / fname))
+    res = ballot.analyze(img)
+    assert res["counts"]["total"] == len(numbers) + 1, "name / number cells must not count as mark boxes"
+    assert [b["number"] for b in res["boxes"] if not b["is_no_vote"]] == numbers  # read from print, not position
+    assert all(b["number_source"] == "printed" for b in res["boxes"] if not b["is_no_vote"])
+    assert res["output"] == 0  # blank ballot = no-vote
+    boxes = {b["number"] if not b["is_no_vote"] else "nv": b["bbox"] for b in res["boxes"]}
+
+    for n in numbers:
+        v = img.copy()
+        big_cross(v, boxes[n])
+        assert ballot.vote(v) == n
+    v = img.copy()
+    big_cross(v, boxes["nv"])
+    assert ballot.vote(v) == 0
+    v = img.copy()
+    big_cross(v, boxes[numbers[0]])
+    big_cross(v, boxes[numbers[3]])
+    assert ballot.vote(v) == -1  # two candidates
+    v = img.copy()
+    big_cross(v, boxes[numbers[1]])
+    big_cross(v, boxes["nv"])
+    assert ballot.vote(v) == -1  # candidate + no-vote
+    v = img.copy()
+    x, y, w, h = boxes[numbers[2]]
+    cv2.polylines(v, [np.array([(x + 25, y + h // 2), (x + w // 3, y + h - 20), (x + w - 20, y + 20)])], False, PEN, 5)
+    assert ballot.vote(v) == -1  # check mark
+    v = img.copy()
+    big_cross(v, boxes[numbers[4]])
+    cv2.putText(v, "hello", (150, 1400), cv2.FONT_HERSHEY_SCRIPT_SIMPLEX, 1.5, PEN, 3)
+    assert ballot.vote(v) == -1  # stray writing
+
+
+if __name__ == "__main__":
+    make_custom_ballots()

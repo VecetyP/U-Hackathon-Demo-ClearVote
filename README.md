@@ -10,7 +10,26 @@ streamlit run app.py      # test bench at http://localhost:8501
 pytest -q                 # 32-box benchmark + synthetic ballots
 ```
 
-The app opens on **Draw on ballot**: the blank EC ballot (`tests/assets/samplevoteFlat.png`) is shown as a canvas. Draw marks with the mouse, press **Analyze** to run them through the pipeline, and use **Undo** / **Clear** to start over. The canvas is a small built-in component in `canvas/index.html`, so there's nothing extra to install. The second tab has file upload, the one-click benchmark and the sample ballots.
+## Integration: one number per ballot
+
+```python
+import cv2, ballot
+code = ballot.vote(cv2.imread("ballot.png"))   # or cv2.imdecode(bytes, cv2.IMREAD_COLOR)
+```
+
+| Ballot | `vote()` returns |
+|---|---|
+| Valid, one candidate marked | that candidate's **printed number** (e.g. `25`) |
+| Valid, chose not to vote (no-vote box marked, or every box empty) | `0` |
+| Invalid (บัตรเสีย) or no ballot found | `-1` |
+
+From the command line: `python ballot.py ballot.png` prints the same code. `ballot.analyze(img)` returns the full result (`output`, `verdict`, per-box labels, strays, overlay image) when you need more than the code.
+
+The candidate number is **read from the print** in the cells left of the X box. A ballot may have up to two cells there, a number cell and a name cell, in either order. They can sit flush against the box or with a gap, and the number can be dark-on-light or light-on-dark. Reading uses an offline digit matcher with templates from common fonts (`digits.npz`, built by `ballot.build_digit_templates()`), so there's no OCR dependency. If no number can be read, it falls back to position (column-major from *First candidate number*), and the app warns you.
+
+## Test bench
+
+The app opens on **Draw on ballot**: the blank EC ballot (`tests/assets/samplevoteFlat.png`) is shown as a canvas. Upload your own (custom) ballot there to draw on it instead. Draw marks with the mouse, press **Analyze** to run them through the pipeline, and use **Undo** / **Clear** to start over. The canvas is a small built-in component in `canvas/index.html`, so there's nothing extra to install. The second tab has file upload, the one-click benchmark and the sample ballots.
 
 ## How it works (`ballot.py`)
 
@@ -18,6 +37,7 @@ The app opens on **Draw on ballot**: the blank EC ballot (`tests/assets/samplevo
 2. **Box detection**: keep long horizontal and vertical strokes (morphological opening) and turn them into rectangles. A rectangle counts as a box when its interior is mostly blank paper and its size is plausible. Pixel positions are never hard-coded. Three kinds of printed cell are dropped:
    - Filled number cells, because their interior isn't blank.
    - The party-list ballot's logo and party-name cells. They sit flush against the next cell, and the mark box is always the rightmost cell in its row.
+   - Name / number label columns on custom ballots: a column whose cells mostly carry black print is labels (a voter marks one box, not most of them).
    - Column headers ("หมายเลขประจำตัวผู้สมัคร", "ช่องทำเครื่องหมาย"). A column holding a single box is a label unless it's the bottom-most box (the no-vote box). The top cells of the columns are compared, and print that repeats across columns is a header. Only top cells are compared, so a voter's two similar marks lower down still void the ballot.
 
    When a frame mostly contains one inner cell (the no-vote frame: label strip on top, mark area below), the inner mark area is used.
@@ -36,6 +56,6 @@ Every threshold is a named constant at the top of its section in `ballot.py`. Tu
 
 ## Known limits
 
-- The candidate number comes from the box's position, not from reading the printed digits. The app shows the printed row beside the result so a person can confirm it. Add digit OCR if real ballots skip numbers.
+- The digit matcher is tuned for printed sans/serif fonts, Thai UI fonts and OpenCV fonts. Decorative or handwritten numbers fall back to position-based numbering.
 - Stray-mark detection assumes a blue or violet pen. Black-pen strays would need a diff against a blank ballot.
 - Torn or folded ballots are not detected beyond the "no boxes found" and "blurry" warnings.
