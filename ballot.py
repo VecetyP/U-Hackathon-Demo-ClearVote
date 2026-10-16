@@ -176,7 +176,7 @@ STD_H = 70         # box crops are rescaled to this height before classification
 RING_STEPS = (1, 1.3, 1.6)  # ring radius multipliers tried in order
 RING = 0.09        # ring radius for crossing detection, fraction of box height
 RETRY_RINGS = (0.14, 0.17, 0.2)  # wider rings tried for the sketchy-stroke retry
-INSIDE_MIN = 0.75  # at least this share of the mark's ink must be inside the box
+CROSS_INSET = 0.1  # the crossing must be this far (fraction of the box) inside its edges; on-the-line = outside
 BRANCH_SUPPORT = 0.25  # share of a crossing cluster that must agree on the branch count
 HOLE_MIN = 10      # enclosed regions smaller than this (px, standard box) are pen-overlap slivers
 ARM_RING = 1.5    # arms are read this many crossing-ring radii out from the crossing
@@ -287,9 +287,11 @@ def classify(crop, rect):
     branches, cx, cy = clusters[0]
     if branches > 4 and not two_lines(crop, cx, cy, ARM_RING * max(RING * h, 1.2 * sw)):
         return "INVALID", 0.75, f"{branches} branches (star / asterisk)"
-    inside = crop[y:y + h, x:x + w]
-    if not (x < cx < x + w and y < cy < y + h) or (inside > 0).sum() < INSIDE_MIN * (crop > 0).sum():
-        return "INVALID", 0.85, "mark outside the box"
+    # where the two lines cross decides it (EC rule): strokes may run past the border, but the crossing must be
+    # clearly inside the box - a cross drawn on the border line itself is outside
+    mx, my = CROSS_INSET * w, CROSS_INSET * h
+    if not (x + mx < cx < x + w - mx and y + my < cy < y + h - my):
+        return "INVALID", 0.85, "crossing point outside the box"
     if not sketchy:
         # "two lines clearly intersect": opposite arms must continue each other (rules out K / arrow shapes),
         # and each arm must keep heading away from the crossing (rules out a V corner hanging off it)
@@ -450,11 +452,43 @@ SHEET_V = 130     # brightness that counts as ballot paper (any colour); dark su
 SHEET_PART = 0.05  # light regions this big (fraction of image) are part of the ballot sheet
 
 
+OVERHANG = 1.0     # box-heights around a marked box within which its overhanging strokes still belong to it
 BALLPOINT_MIN = 0.6  # a ballpoint doodle is at least this many box-heights in both directions
 PEN_SAT = 120  # pen ink saturation that counts anywhere; camera fringes on dark print stay below it
 
 
-def stray_marks(img, boxes, lines=None):
+def mark_overhang(gray, ink, marked):
+    """Ink that continues out of a marked box (a stroke running past the border) belongs to that box's mark, not
+    a stray. Limited to about one box-height around the box, so a far doodle can't be pulled in via printed lines.
+    Outside the box the stroke may cross darker paper (a green panel in shadow), so a more sensitive ink measure
+    is used there; this only ever removes false strays, it never changes a box's label."""
+    out = np.zeros(ink.shape, np.uint8)
+    if not marked:
+        return out
+    k = max(9, int(0.3 * np.median([h for *_, h in marked])) | 1)
+    paper = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    ink = ((ink > 0) | (gray.astype(np.int16) < paper.astype(np.int16) - 25)).astype(np.uint8)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
+    sizes = st[:, 4]
+    for x, y, w, h in marked:
+        p = int(0.2 * min(w, h))
+        ids = np.unique(lab[y + p:y + h - p, x + p:x + w - p])
+        ids = ids[ids > 0]
+        if not len(ids):
+            continue
+        r = int(OVERHANG * h)
+        y0, y1, x0, x1 = max(0, y - r), y + h + r, max(0, x - r), x + w + r
+        mark = np.isin(lab[y0:y1, x0:x1], ids).astype(np.uint8)
+        # a stroke leaving the box often crosses a dark printed border / column edge, where ink is invisible:
+        # bridge that small gap, then take the stroke-sized ink it reaches (never big print like a number column)
+        g = max(3, int(0.3 * h)) | 1
+        reach = cv2.dilate(mark, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (g, g)))
+        near = [i for i in np.unique(lab[y0:y1, x0:x1][reach > 0]) if i > 0 and sizes[i] <= 2 * w * h]
+        out[y0:y1, x0:x1] |= mark | np.isin(lab[y0:y1, x0:x1], near).astype(np.uint8)
+    return cv2.dilate(out, np.ones((7, 7), np.uint8))
+
+
+def stray_marks(img, boxes, lines=None, attached=None):
     """Ink outside every (expanded) voting box -> list of bboxes. Three independent detectors:
     1. vivid pen colour (digital pens, bright blue ink) anywhere on the sheet;
     2. faint ballpoint on white / neutral paper: darker than the paper AND shifted toward blue (black print isn't);
@@ -469,6 +503,8 @@ def stray_marks(img, boxes, lines=None):
     for x, y, w, h in boxes:
         m = int(MARGIN * h)
         grid[max(0, y - m):y + h + m, max(0, x - m):x + w + m] = 1
+    if attached is not None:
+        grid |= attached  # strokes overhanging from a marked box are part of that mark
 
     # 1. vivid pen colour. A phone camera adds a desaturated navy fringe around white-on-black print; real pen ink
     #    is strongly saturated anywhere, and fainter strokes only count on light paper
@@ -593,7 +629,8 @@ def analyze(img, first_number=1):
             number, source = (number, "printed") if number is not None else (first_number + i, "position")
         res["boxes"].append(dict(bbox=b, number=number, number_source=source, is_no_vote=b == no_vote,
                                  label=label, confidence=conf, reason=reason))
-    res["strays"] = stray_marks(img, boxes, lines)
+    marked = [r["bbox"] for r in res["boxes"] if r["label"] != "EMPTY"]
+    res["strays"] = stray_marks(img, boxes, lines, attached=mark_overhang(gray, ink, marked))
     counts = {k: sum(r["label"] == k for r in res["boxes"]) for k in COLORS}
     res["counts"] = dict(total=len(boxes), **counts)
     valid = [r for r in res["boxes"] if r["label"] == "VALID"]
@@ -784,11 +821,15 @@ def read_number(gray, boxes, b):
             disc = a > 0.9 * hull and a > 0.7 * gw * gh and 0.75 < gw / gh < 1.33  # round solid blob (logo)
             if gw > 1.1 * gh or not 0.15 * gw * gh < a < 0.85 * gw * gh or disc:
                 if gw <= 1.6 * gh and a < 0.85 * gw * gh:
-                    marks.append((gx, gy, gw, gh, None))  # letter-like but not a digit (a wide 'm', a logo glyph)
+                    marks.append((gx, gy, gw, gh, None, a / (gw * gh)))  # letter-like, not a digit (wide 'm', logo)
                 continue  # blank cell paper (wide and solid) is neither
-            marks.append((gx, gy, gw, gh, m))
-    # the hole of a light '0' shows up as a dark mark inside it: keep only outermost marks
+            marks.append((gx, gy, gw, gh, m, a / (gw * gh)))
     inside = lambda a, b: a is not b and b[0] <= a[0] and b[1] <= a[1] and a[0] + a[2] <= b[0] + b[2] and a[1] + a[3] <= b[1] + b[3]
+    # a cell's own border is a hollow frame around its text: never a glyph (and it must not hide the digits in it)
+    # (a big '0' also encloses something - its own hole - but it is drawn with solid strokes; a border is thin)
+    frame = lambda g: g[3] > 0.5 * h and g[5] < 0.25 and any(inside(o, g) and o[4] is not None for o in marks)
+    marks = [g for g in marks if not frame(g)]
+    # the hole of a light '0' shows up as a dark mark inside it: keep only outermost marks
     marks = sorted((g for g in marks if not any(inside(g, o) for o in marks)), key=lambda g: g[0])
     best = (None, 0.0)
     for c0, c1 in printed_cells(strip, thr, h):

@@ -482,3 +482,40 @@ def test_food_ballot_number_name_box():
     assert [b["number"] for b in blank["boxes"] if not b["is_no_vote"]] == list(range(1, 27))
     assert blank["output"] == 0 and not blank["strays"]
     assert ballot.vote(cv2.imread(str(assets / "number_name_space_drawn.png")), first_number=9000) == 2
+
+
+def test_strokes_overhanging_the_box():
+    """EC / poll-worker rule: where the two lines cross decides it. A stroke may run past the box border (even onto
+    the coloured panel beyond the number column) and the box is still a valid vote - the overhang is part of that
+    mark, not a stray. A separate doodle nearby, or a stroke reaching into another box, still voids the ballot."""
+    base = cv2.imread(str(pathlib.Path(__file__).parent / "assets" / "U-hackathon-demo-phone-picture-cropped.png"))
+    res = ballot.analyze(base)
+    boxes = {b["number"]: b["bbox"] for b in res["boxes"] if not b["is_no_vote"]}
+    n_real = len(res["strays"])  # the photo's own 4 doodles
+    app_pen = (191, 63, 31)
+
+    def x_with_tail(img, b, out):
+        x, y, w, h = b
+        c = np.array([x + .5 * w, y + .5 * h])
+        s1 = [c + (-.35 * w, .3 * h), c + (.2 * w, -.1 * h), c + (.5 * w + out * w, -.3 * h),
+              c + (.55 * w + out * w, -.05 * h), c + (.45 * w + out * w, .1 * h)]  # runs out of the box, then hooks
+        s2 = [c + (-.3 * w, -.3 * h), c + (.35 * w, .32 * h)]
+        for st in (s1, s2):
+            cv2.polylines(img, [np.int32(st)], False, app_pen, 5, cv2.LINE_AA)
+        return img
+
+    for out in (0.1, 0.3, 0.8):
+        r = ballot.analyze(x_with_tail(base.copy(), boxes[508], out))
+        assert {b["number"]: b["label"] for b in r["boxes"]}[508] == "VALID", out
+        assert len(r["strays"]) == n_real, (out, r["strays"])
+
+    x, y, w, h = boxes[508]
+    v = x_with_tail(base.copy(), boxes[508], 0.4)
+    cv2.ellipse(v, (x + w + int(1.6 * h), y + h // 2), (int(.4 * h), int(.35 * h)), 0, 0, 330, app_pen, 4)
+    assert len(ballot.analyze(v)["strays"]) == n_real + 1  # a separate doodle is still a stray
+
+    v = base.copy()
+    c = np.array([x + .5 * w, boxes[507][1] + .5 * h])
+    cv2.line(v, tuple(np.int32(c + (-.3 * w, -.3 * h))), tuple(np.int32(c + (.3 * w, .3 * h))), app_pen, 5)
+    cv2.line(v, tuple(np.int32(c + (-.3 * w, .3 * h))), (int(x + .6 * w), int(y + .5 * h)), app_pen, 5)
+    assert ballot.vote(v) == -1  # a stroke from 507 reaching into 508
