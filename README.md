@@ -98,29 +98,61 @@ The app opens on **Draw on ballot**: the blank EC ballot (`tests/assets/samplevo
 
 ## How it works (`ballot.py`)
 
-1. **Normalize**: downscale large photos, auto-invert dark images, and warn on blur.
-2. **Box detection**: keep long horizontal and vertical strokes (morphological opening) and turn them into rectangles. A rectangle counts as a box when its interior is mostly blank paper and its size is plausible. Pixel positions are never hard-coded. Three kinds of printed cell are dropped:
-   - Filled number cells, because their interior isn't blank.
-   - The party-list ballot's logo and party-name cells. They sit flush against the next cell, and the mark box is always the rightmost cell in its row.
-   - Name / number label columns on custom ballots: a column whose cells mostly carry black print is labels (a voter marks one box, not most of them).
-   - Column headers ("หมายเลขประจำตัวผู้สมัคร", "ช่องทำเครื่องหมาย"). A column holding a single box is a label unless it's the bottom-most box (the no-vote box). The top cells of the columns are compared, and print that repeats across columns is a header. Only top cells are compared, so a voter's two similar marks lower down still void the ballot.
+<img src="ClearVote_Pipeline.png" alt="ClearVote ballot verification pipeline: normalize, find voting boxes, read candidate number, classify each mark, scan sheet for strays, verdict" width="1000">
 
-   When a frame mostly contains one inner cell (the no-vote frame: label strip on top, mark area below), the inner mark area is used.
-3. **Layout**: the **no-vote box** (ไม่ประสงค์เลือกผู้สมัครผู้ใด) is the box that sits in a column of its own (bottom-right on EC 2569 ballots) or is set apart below the grid. It is classified with the same rules as any other box. The other boxes are numbered column-major. Set *First candidate number* in the app (501 for the EC sample ballot).
-4. **Ink per box**: the printed border is erased and strokes that cross it are re-bridged. Ink in the margin counts only if it continues from inside the box. The crop is rescaled to a standard height and at most 1.8:1 width, so an X across a wide box is as steep as one in a candidate box.
-5. **Topology classifier**: the mark is skeletonized. For every skeleton point, the classifier counts how many strokes cross a small ring around it.
-   - **VALID**: exactly one place where 4 strokes meet (X, +, curved or looped crosses, long tails). That crossing point must be clearly inside the box (at least 10% in from the edges): strokes may run past the border, and that overhang counts as part of the mark rather than a stray. A cross drawn on the border line itself is outside. Sketchy double-stroke crosses get a merged retry.
-   - **INVALID**: no crossing (✓ V ^ / ○ □ ♡ ·), a narrow V whose tip fakes a crossing (all its ink lies on one side of that point), overlapping double crosses (6+ arms leave the crossing), more than 4 branches (✱), two or more enclosed regions (☆), several crossings or marks (XX, X X), extra writing next to the cross ((X), X + text), or a mark outside the box.
-6. **Stray marks**: ink anywhere on the ballot sheet outside the boxes, found by three detectors:
-   - **Vivid pen colour**, for digital pens and bright blue ink.
-   - **Faint ballpoint on white paper.** The ink is darker than the paper around it and shifted toward blue in Lab colour space; black print isn't.
-   - **Dark freehand marks on coloured panels.** Translucent blue-black ink photographs almost neutral there, so it's told apart from print by shape: pen-width strokes, at least about half a box in size, enclosing paper rather than solid, not part of the box grid, the large dark print or a long printed line.
-7. **Verdict**:
-   - **บัตรเสีย**: any INVALID box, two or more VALID boxes, or any stray mark.
-   - **บัตรดี**: exactly one VALID candidate box.
-   - **บัตรไม่ประสงค์ลงคะแนน**: only the no-vote box is marked, or every box is empty.
+A photo, scan or canvas drawing goes through six stages. It's all classical computer vision with Python, OpenCV and NumPy: no neural network, no training data, no cloud. The same image always gives the same answer, and every decision comes with a reason.
 
-Every threshold is a named constant at the top of its section in `ballot.py`. Tune them there.
+### 1. Normalize
+- Downscale to at most 1600 px on the longest side, and warn if the image looks blurry.
+- Treat the image as a negative (white print on black) only if the ballot is actually found that way. A phone photo with a dark surround is as dark on average as a true negative, so brightness alone can't decide.
+
+### 2. Find voting boxes
+- **Line extraction:** keep long horizontal and vertical strokes (morphological opening) and trace the rectangles they form. A rectangle counts as a box when its size is plausible and its inside is mostly blank paper. Pixel positions are never hard-coded, so scale, tilt and margins can vary.
+- **White-blob fallback:** a box whose border is lost to perspective or shadow (for example a bottom row flush with a dark column) is still found as a white rectangle.
+- **Drop printed cells** that look like boxes:
+  - filled number cells, because their inside isn't blank;
+  - logo and name cells flush against the box, because the mark box is the rightmost cell of its row;
+  - name/number label columns, because a voter marks one box, not most of them;
+  - column headers ("หมายเลขประจำตัวผู้สมัคร", "ช่องทำเครื่องหมาย"), because their print repeats across columns.
+- **No-vote box** (ไม่ประสงค์เลือกผู้สมัครผู้ใด): the box in a column of its own (bottom right on EC 2569 ballots) or set apart below the grid. If its frame holds a label strip and a mark area, the mark area is used.
+- Candidate boxes are ordered column-major.
+
+### 3. Read candidate number
+- Split the row to the left of the box into printed cells at their border lines. A row may hold a number cell, or a number cell and a name cell in either order, flush or with gaps.
+- Use only a cell where everything printed is a confident digit: 1 to 4 digits, no leading zero. A name never contributes, even when its letters look like digits (B~8, O~0, l~1).
+- Digits are matched against templates from 26 fonts (`digits.npz`) by cosine similarity, at least 0.80. There's no OCR dependency.
+- If no number can be read, the box is numbered by position from *First candidate number*, and the output marks it `number_source: "position"`.
+
+### 4. Classify each mark
+- Erase the box's printed border, crop the box with a margin, and rescale it to a standard size (at most 1.8:1, so an X across a wide box is as steep as in a candidate box).
+- Skeletonize the ink and, for every skeleton point, count how many strokes cross a small ring around it. Four strokes meeting means a crossing.
+- **VALID** needs all of these:
+  - 4 arms leave the crossing and form **two straight lines** (opposite arms line up);
+  - the **crossing point is at least 10% inside the box**. Strokes may run past the border, and that overhang belongs to the mark. A cross drawn on the border line itself is outside;
+  - the ink is not all on one side of the crossing, which would make it a narrow V;
+  - fewer than 6 arms (more means an overlapping double cross);
+  - fewer than 2 enclosed loops (more means a star).
+- Everything else is **INVALID**: ✓ V ^ / ○ □ ♡ ·, double crosses, crossed-out attempts, crosses with extra writing, and crosses outside the box. A box with no ink is **EMPTY**.
+
+### 5. Scan the sheet for strays
+Any ink on the ballot outside the boxes voids it. Three independent detectors look for it:
+- **A. Vivid pen colour**, for digital pens and bright blue ink, anywhere on the sheet.
+- **B. Faint ink on white paper.** It's darker than the paper around it and shifted toward blue in Lab colour space; black print isn't.
+- **C. Dark freehand marks on coloured panels.** Translucent blue-black ink photographs almost neutral on green or pink, so it's told apart from print by shape: pen-width strokes, at least about half a box in size, enclosing paper rather than solid, and not part of the box grid, the large dark print or a long printed line.
+
+Ink that continues out of a marked box (a stroke running past the border) is part of that mark, not a stray.
+
+### 6. Verdict
+
+| Result | Rule | `output` |
+|---|---|---|
+| **บัตรดี** (valid) | exactly one VALID candidate box, no stray marks | candidate number |
+| **บัตรไม่ประสงค์ลงคะแนน** (no vote) | only the no-vote box is marked, or every box is empty | `0` |
+| **บัตรเสีย** (invalid) | any INVALID box, two or more VALID boxes, or any stray mark | `-1` |
+
+The result comes back as the output code, an analysis (verdict, reason and a per-mark list) and an annotated image. You can get it through `vote()` / `evaluate()` in Python, `POST /evaluate` over HTTP, or the Streamlit test bench.
+
+Every threshold is a named constant in `ballot.py`; tune them there. The pipeline scores 32/32 on the Election Commission's official benchmark and is covered by 19 automated tests (`pytest -q`).
 
 ## Known limits
 
